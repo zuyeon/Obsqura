@@ -174,7 +174,7 @@ class MainActivity : ComponentActivity() {
                                         .distinctBy { it.device.address }
                                         .sortedByDescending {
                                             it.displayName == "RPi-LED" ||
-                                                    it.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
+                                                    it.device.address.uppercase() == "04:7F:0E:78:E8:B0"
                                         }
                                 }
                             },
@@ -187,7 +187,7 @@ class MainActivity : ComponentActivity() {
                         LazyColumn(modifier = Modifier.fillMaxHeight().weight(1f)) {
                             items(scannedDevices) { customDevice ->
                                 val isRPi = customDevice.displayName == "RPi-LED" ||
-                                        customDevice.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
+                                        customDevice.device.address.uppercase() == "04:7F:0E:78:E8:B0"
 
                                 Card(
                                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
