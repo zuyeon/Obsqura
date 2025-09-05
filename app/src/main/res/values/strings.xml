@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Obsqura</string>
+    <string name="start_scan">스캔 시작</string>
+    <string name="send_data">데이터 전송</string>
+</resources>
