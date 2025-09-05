@@ -1,4 +1,4 @@
-package com.example.Obsqura.ui.theme
+package com.example.obsqura.ui.theme
 
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme

@@ -1,4 +1,4 @@
-package com.example.Obsqura
+package com.example.obsqura
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -26,7 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
-import com.example.Obsqura.ui.theme.BLECommunicatorTheme
+import com.example.obsqura.ui.theme.BLECommunicatorTheme
 import java.text.SimpleDateFormat
 import java.util.*
 

@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Obsqura"
+rootProject.name = "obsqura"
 include(":app")

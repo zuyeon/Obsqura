@@ -1,4 +1,4 @@
-package com.example.Obsqura
+package com.example.obsqura
 
 import kotlin.math.ceil
 

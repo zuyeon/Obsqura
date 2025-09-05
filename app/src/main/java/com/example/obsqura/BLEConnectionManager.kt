@@ -2,7 +2,7 @@
 
 @file:Suppress("DEPRECATION")
 
-package com.example.Obsqura
+package com.example.obsqura
 
 import android.Manifest
 import android.annotation.SuppressLint

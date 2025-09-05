@@ -1,4 +1,4 @@
-package com.example.Obsqura
+package com.example.obsqura
 
 import android.Manifest
 import android.bluetooth.BluetoothDevice
