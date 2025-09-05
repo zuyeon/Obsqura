@@ -41,7 +41,7 @@ JNIEXPORT jobject JNICALL Java_com_example_blecommunicator_KyberJNI_encapsulate(
     (*env)->SetByteArrayRegion(env, sharedkey_array, 0, CRYPTO_BYTES, (jbyte *)ss);
 
     // 4. Pair<byte[], byte[]> 형태로 반환 (Java의 KyberResult 클래스 필요)
-    jclass resultClass = (*env)->FindClass(env, "com/example/Obsqura/KyberResult");
+    jclass resultClass = (*env)->FindClass(env, "com/example/obsqura/KyberResult");
     if (resultClass == NULL) {
         LOGE("❌ KyberResult 클래스 찾기 실패");
         return NULL;

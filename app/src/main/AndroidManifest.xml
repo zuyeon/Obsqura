@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="obsqura">
+    package="com.example.obsqura">
+
+    <!-- BLE 하드웨어 선언 (중요) -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
 
     <!-- Bluetooth 권한 -->
     <uses-permission android:name="android.permission.BLUETOOTH"/>
@@ -11,6 +17,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!-- Android 12+ 전용 권한(단말이 28이면 자동 무시됨) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" tools:targetApi="31"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="31"/>
 
     <application
         android:allowBackup="true"
@@ -31,6 +40,5 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
     </application>
 </manifest>
