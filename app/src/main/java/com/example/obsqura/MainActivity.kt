@@ -378,3 +378,4 @@ class MainActivity : ComponentActivity() {
 }
 
 data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)
+
