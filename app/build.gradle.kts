@@ -16,17 +16,18 @@ android {
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // 기기 ABI에 맞게 (요즘은 arm64-v8a 필수)
         ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
 
-        // ✅ CMake 인자 여기서 설정
+        // CMake 인자 (C만 쓰면 STL 불필요)
         externalNativeBuild {
             cmake {
                 arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-24",
-                    "-DCMAKE_C_FLAGS=-std=c99"
+                    "-DANDROID_PLATFORM=android-24"
+                    // C99 강제가 필요하면 ↓ 한 줄 추가
+                    // "-DCMAKE_C_FLAGS=-std=c99"
                 )
             }
         }
@@ -46,25 +47,19 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+    kotlinOptions { jvmTarget = "11" }
 
-    kotlinOptions {
-        jvmTarget = "11"
-    }
+    buildFeatures { compose = true }
 
-    buildFeatures {
-        compose = true
-    }
-
-    // ✅ CMake 빌드 경로 설정
+    // CMakeLists.txt 경로 연결
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            // version = "3.10.2"
         }
     }
 
-    // ✅ jniLibs 경로 설정 (jni는 제거됨)
-    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+    // (prebuilt .so 를 직접 넣는 게 아니라면 굳이 필요 없음)
+    // sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
 }
 
 dependencies {
@@ -76,13 +71,11 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
-
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.ui.test.junit4)
-
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }

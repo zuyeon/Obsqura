@@ -27,7 +27,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.core.app.ActivityCompat
 import com.example.obsqura.ui.theme.BLECommunicatorTheme
 import java.text.SimpleDateFormat
 import java.util.*
@@ -38,22 +41,21 @@ class MainActivity : ComponentActivity() {
     private lateinit var bleConnectionManager: BLEConnectionManager
     private var bluetoothLeScanner: BluetoothLeScanner? = null
 
-    // 스캔 상태/핸들러/콜백을 "전역 1개"만 유지
+    // 🔹 스캔 상태/핸들러/콜백을 "전역 1개"만 유지
     private var isScanning = false
     private val handler = Handler(Looper.getMainLooper())
     private var onDeviceFound: ((CustomBluetoothDevice) -> Unit)? = null
 
-    // ScanCallback 재사용 (APPLICATION_REGISTRATION_FAILED(2) 방지)
+    // 🔹 ScanCallback은 재사용 (매번 새로 만들면 APPLICATION_REGISTRATION_FAILED(2) 잘 뜸)
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            // Android 12+에서 device.name 접근은 BLUETOOTH_CONNECT 권한 필요할 수 있어 try/catch
-            val deviceName = try {
-                device.name ?: result.scanRecord?.deviceName ?: "이름 없음"
-            } catch (se: SecurityException) {
-                Log.w("BLE_SCAN", "device.name access denied: ${se.message}")
-                "이름 없음"
+            val rawName: String? = if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                device.name
+            } else {
+                result.scanRecord?.deviceName
             }
+            val deviceName = rawName ?: "이름 없음"
             Log.d("BLE_SCAN", "📡 발견: $deviceName (${device.address}), rssi=${result.rssi}")
             onDeviceFound?.invoke(CustomBluetoothDevice(device, deviceName))
         }
@@ -66,46 +68,37 @@ class MainActivity : ComponentActivity() {
     // -------- 권한 처리 --------
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
-            // 모든 권한이 허용되었는지 확인
-            val granted = perms.values.all { it }
-            if (granted) {
-                // 권한 허용 직후 스캔 재시작(콜백은 UI 쪽에서 다시 설정되므로 no-op로 안전 호출)
-                startBleScan { /* no-op; 실제 UI setContent 내에서 설정됨 */ }
-            } else {
-                Toast.makeText(this, "권한이 없어 스캔할 수 없습니다.", Toast.LENGTH_SHORT).show()
-            }
+            perms.forEach { Log.d("Permissions", "${it.key}=${it.value}") }
         }
 
     private fun hasScanPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
-                    ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-                    // 일부 기기 호환성: 위치 권한을 요구하는 경우가 있어 함께 확인
-                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+                    checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
+                    // 일부 기기에서 여전히 필요
+                    checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         }
     }
 
     private fun requestPermissionsIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            requestPermissionsLauncher.launch(
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.ACCESS_FINE_LOCATION // 호환성 고려(일부 기기)
-                )
-            )
+            requestPermissionsLauncher.launch(arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ))
         } else {
-            requestPermissionsLauncher.launch(
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
-            )
+            // 🔹 안드9(API 28)에서는 위치 권한 필수
+            requestPermissionsLauncher.launch(arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ))
         }
     }
 
-    // Android 12 미만에서만 위치 서비스가 스캔 성공에 관여
+    // 🔹 안드9에서는 위치 서비스(고정/네트워크) OFF면 스캔 실패
     private fun isLocationEnabled(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return true
         val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         return lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
                 lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
@@ -123,10 +116,14 @@ class MainActivity : ComponentActivity() {
         var publicKeyBase64 by mutableStateOf<String?>(null)
         var logMessages by mutableStateOf<List<String>>(emptyList())
 
+        var progressSent by mutableStateOf(0)
+        var progressTotal by mutableStateOf(0)
+        var showProgress by mutableStateOf(false)
+
         fun addLog(msg: String) {
             logMessages = (logMessages + msg).takeLast(100)
-            if (msg.contains("LED 명령 전체 전송 완료")) {
-                Toast.makeText(this@MainActivity, "LED 명령 전송이 완료되었습니다!", Toast.LENGTH_SHORT).show()
+            if (msg.contains("LED 명령 전체 전송 완료") || msg.contains("전체 패킷 전송 완료")) {
+                Toast.makeText(this@MainActivity, "전송이 완료되었습니다!", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -136,10 +133,17 @@ class MainActivity : ComponentActivity() {
                 publicKeyBase64 = base64
                 addLog("📥 공개키 수신 완료")
             },
-            logCallback = { msg -> addLog(msg) }
+            logCallback = { msg -> addLog(msg) },
+            progressCallback = { sent, total ->   // ✅ 진행률 콜백
+                progressSent = sent
+                progressTotal = total
+                showProgress = total > 0 && sent < total
+                if (total > 0 && sent >= total) {
+                    showProgress = false
+                }
+            }
         )
 
-        // 최초 진입 시 권한 요청
         requestPermissionsIfNeeded()
 
         setContent {
@@ -153,16 +157,33 @@ class MainActivity : ComponentActivity() {
                 var connectedTime by remember { mutableStateOf<String?>(null) }
                 var ledOn by remember { mutableStateOf(false) }
 
+                // === 텍스트 전송 UI에서 사용할 상태 ===
+                var messageText by remember { mutableStateOf("") }
+                // ===================================
+
+                if (showProgress) {
+                    AlertDialog(
+                        onDismissRequest = { /* 전송중에는 닫지 않음 */ },
+                        confirmButton = {},
+                        title = { Text("전송 중…") },
+                        text = {
+                            val pct = if (progressTotal == 0) 0f else progressSent.toFloat() / progressTotal
+                            Column {
+                                LinearProgressIndicator(progress = pct, modifier = Modifier.fillMaxWidth())
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text("${progressSent} / ${progressTotal} 패킷 전송")
+                            }
+                        }
+                    )
+                }
+
                 Surface(modifier = Modifier.fillMaxSize(), color = Color.White) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text(
-                            "BLE 스캐너",
-                            style = MaterialTheme.typography.headlineMedium.copy(color = Color.Black)
-                        )
+                        Text("BLE 스캐너", style = MaterialTheme.typography.headlineMedium.copy(color = pink))
                         Spacer(modifier = Modifier.height(8.dp))
 
                         connectedDevice?.let { device ->
-                            Text("✅ Connected Device:", color = Color.DarkGray)
+                            Text("✅ Connected Device:", color = Color.Black)
                             Text("• Name: ${device.name ?: "Unknown"}", color = pink)
                             Text("• Address: ${device.address}", color = pink)
                             connectedTime?.let { Text("• Connected at: $it", color = pink) }
@@ -192,7 +213,7 @@ class MainActivity : ComponentActivity() {
                                         .distinctBy { it.device.address }
                                         .sortedByDescending {
                                             it.displayName == "RPi-LED" ||
-                                                    it.device.address.uppercase() == "04:7F:0E:78:E8:B0"
+                                                    it.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
                                         }
                                 }
                             },
@@ -205,12 +226,10 @@ class MainActivity : ComponentActivity() {
                         LazyColumn(modifier = Modifier.fillMaxHeight().weight(1f)) {
                             items(scannedDevices) { customDevice ->
                                 val isRPi = customDevice.displayName == "RPi-LED" ||
-                                        customDevice.device.address.uppercase() == "04:7F:0E:78:E8:B0"
+                                        customDevice.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
 
                                 Card(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                     colors = CardDefaults.cardColors(
                                         containerColor = if (isRPi) lightGreenBg else Color.White
                                     ),
@@ -223,7 +242,7 @@ class MainActivity : ComponentActivity() {
                                         )
                                         Text(
                                             "주소: ${customDevice.device.address}",
-                                            color = if (isRPi) green else Color.DarkGray
+                                            color = if (isRPi) green else Color.Black
                                         )
                                         Spacer(modifier = Modifier.height(8.dp))
 
@@ -244,7 +263,7 @@ class MainActivity : ComponentActivity() {
                                                     connectedDevice = null
                                                     connectedTime = null
                                                 },
-                                                colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
+                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
                                             ) { Text("🔌 해제") }
                                         }
 
@@ -284,13 +303,14 @@ class MainActivity : ComponentActivity() {
 
                                         Button(
                                             onClick = {
-                                                val serviceUUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
-                                                val charUUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
-                                                bleConnectionManager.sendData(serviceUUID, charUUID, "KYBER_REQ".toByteArray())
+                                                // 기존: sendData(..., "KYBER_REQ".toByteArray())
+                                                // 새로: 패킷 분할 방식으로 전송
+                                                bleConnectionManager.sendKyberRequestPacketized()
                                             },
                                             colors = ButtonDefaults.buttonColors(containerColor = pink),
                                             modifier = Modifier.fillMaxWidth()
                                         ) { Text("🔐 공개키 요청") }
+
 
                                         Spacer(modifier = Modifier.height(8.dp))
 
@@ -304,17 +324,86 @@ class MainActivity : ComponentActivity() {
                                             modifier = Modifier.fillMaxWidth()
                                         ) { Text("📶 Ping 테스트") }
 
+                                        // === 텍스트 전송 UI 시작 ===
+                                        Spacer(modifier = Modifier.height(16.dp))
+                                        Text("✉️ 텍스트 전송", color = Color.Black)
+                                        OutlinedTextField(
+                                            value = messageText,
+                                            onValueChange = { messageText = it },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            placeholder = { Text("보낼 메시지를 입력하세요", color = Color.Gray) },
+                                            singleLine = true,
+                                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                                            keyboardActions = KeyboardActions(
+                                                onSend = {
+                                                    if (messageText.isNotBlank()) {
+                                                        bleConnectionManager.sendPlainTextMessage(messageText)
+                                                        messageText = ""
+                                                    }
+                                                }
+                                            ),
+                                            // ✅ 입력 글자색을 확실히 지정
+                                            textStyle = LocalTextStyle.current.copy(color = Color.Black),
+                                            // ✅ Material3 TextField 색상 명시
+                                            colors = TextFieldDefaults.colors(
+                                                focusedTextColor = Color.Black,
+                                                unfocusedTextColor = Color.Black,
+                                                disabledTextColor = Color.Black,
+                                                cursorColor = Color.Black,
+
+                                                focusedContainerColor = Color.White,
+                                                unfocusedContainerColor = Color.White,
+                                                disabledContainerColor = Color.White,
+
+                                                focusedIndicatorColor = Color.Black,    // 아웃라인 색
+                                                unfocusedIndicatorColor = Color.Gray,
+
+                                                focusedPlaceholderColor = Color.DarkGray,
+                                                unfocusedPlaceholderColor = Color.Gray
+                                            )
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Row {
+                                            Button(
+                                                onClick = {
+                                                    if (messageText.isBlank()) {
+                                                        Toast.makeText(this@MainActivity, "메시지를 입력하세요.", Toast.LENGTH_SHORT).show()
+                                                        return@Button
+                                                    }
+                                                    bleConnectionManager.sendPlainTextMessage(messageText)
+                                                    messageText = ""
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
+                                            ) { Text("📨 평문 전송") }
+
+                                            Spacer(modifier = Modifier.width(8.dp))
+
+                                            Button(
+                                                onClick = {
+                                                    if (messageText.isBlank()) {
+                                                        Toast.makeText(this@MainActivity, "메시지를 입력하세요.", Toast.LENGTH_SHORT).show()
+                                                        return@Button
+                                                    }
+                                                    bleConnectionManager.sendEncryptedTextMessage(messageText)
+                                                    bleConnectionManager.logSharedKey()
+                                                    messageText = ""
+                                                },
+                                                modifier = Modifier.weight(1f),
+                                                colors = ButtonDefaults.buttonColors(containerColor = green)
+                                            ) { Text("🔒 암호 전송") }
+                                        }
+                                        // === 텍스트 전송 UI 끝 ===
+
                                         publicKeyBase64?.let {
                                             Spacer(modifier = Modifier.height(12.dp))
-                                            Text("📄 공개키 (Base64):", color = Color.Gray)
-                                            Text(it, color = Color.DarkGray, modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(8.dp))
+                                            Text("📄 공개키 (Base64):", color = Color.Black)
+                                            Text(it, color = Color.Black, modifier = Modifier.fillMaxWidth().padding(8.dp))
                                         }
 
                                         Spacer(modifier = Modifier.height(8.dp))
 
-                                        Text("📜 BLE 로그:", style = MaterialTheme.typography.titleSmall, color = Color.Gray)
+                                        Text("📜 BLE 로그:", style = MaterialTheme.typography.titleSmall, color = Color.Black)
                                         LazyColumn(modifier = Modifier.fillMaxWidth().height(120.dp)) {
                                             items(logMessages) { log -> Text(log, style = MaterialTheme.typography.bodySmall) }
                                         }
@@ -332,6 +421,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun startBleScan(onFound: (CustomBluetoothDevice) -> Unit) {
         onDeviceFound = onFound
+
         if (isScanning) return
 
         if (!hasScanPermission()) {
@@ -356,15 +446,9 @@ class MainActivity : ComponentActivity() {
         // 안전을 위해 시작 전에 stop 한번
         runCatching { scanner.stopScan(scanCallback) }
 
-        // Lint 요구: SecurityException 대비
-        try {
-            scanner.startScan(scanCallback)
-            isScanning = true
-            handler.postDelayed({ stopBleScan() }, 10_000)
-        } catch (se: SecurityException) {
-            Log.e("BLE_SCAN", "startScan SecurityException: ${se.message}")
-            Toast.makeText(this, "스캔 권한이 거부되어 실행할 수 없습니다.", Toast.LENGTH_SHORT).show()
-        }
+        scanner.startScan(scanCallback)
+        isScanning = true
+        handler.postDelayed({ stopBleScan() }, 10_000)
     }
 
     @SuppressLint("MissingPermission")
@@ -378,4 +462,3 @@ class MainActivity : ComponentActivity() {
 }
 
 data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)
-

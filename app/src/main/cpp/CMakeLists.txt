@@ -1,55 +1,34 @@
 cmake_minimum_required(VERSION 3.10.2)
+project(kyberjni)
 
-project("kyberjni")
-
-# 🔹 C 표준 지정
+# C 표준
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 🔹 Kyber 소스 디렉토리 정의
-set(KYBER_DIR ${CMAKE_SOURCE_DIR}/kyber)
+# 현재 CMake 파일 기준 kyber 디렉토리
+set(KYBER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kyber)
 
-# 🔹 Kyber 관련 C 파일 목록
-file(GLOB KYBER_SRC
-        ${KYBER_DIR}/*.c
-)
+# kyber/*.c 모두 포함
+file(GLOB KYBER_SRC "${KYBER_DIR}/*.c")
 
-# 🔹 JNI C 파일 명시 (직접 지정)
-set(JNI_SRC
-        ${KYBER_DIR}/kyber_jni.c
-)
+# 테스트/샘플 소스는 제외 (있다면)
+list(FILTER KYBER_SRC EXCLUDE REGEX "kyber_test\\.c$")
+list(FILTER KYBER_SRC EXCLUDE REGEX "test.*\\.c$")
+list(FILTER KYBER_SRC EXCLUDE REGEX "main\\.c$")
+list(FILTER KYBER_SRC EXCLUDE REGEX "x64\\.Debug/.*\\.c$")
 
-# 🔹 전체 파일 지정
-set(ALL_SRC
-        ${KYBER_SRC}
-        ${JNI_SRC}
-)
+# JNI 구현 파일 명시 (cpp/kyber/kyber_jni.c)
+set(JNI_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kyber/kyber_jni.c")
 
-# 🔹 C 소스로 강제 지정
-set_source_files_properties(${ALL_SRC} PROPERTIES LANGUAGE C)
+# 라이브러리 생성
+add_library(kyberjni SHARED ${KYBER_SRC} ${JNI_SRC})
 
-# 🔹 라이브러리 생성
-add_library(
-        kyberjni
-        SHARED
-        ${ALL_SRC}
-)
+# 로그 라이브러리
+find_library(log-lib log)
 
-# 🔹 log 라이브러리 찾기
-find_library(
-        log-lib
-        log
-)
+# 헤더 경로
+target_include_directories(kyberjni PRIVATE ${KYBER_DIR})
 
-# 🔹 헤더 디렉토리 등록
-target_include_directories(
-        kyberjni
-        PRIVATE
-        ${KYBER_DIR}
-)
-
-# 🔹 log 링크
-target_link_libraries(
-        kyberjni
-        ${log-lib}
-)
+# 링크
+target_link_libraries(kyberjni ${log-lib})
