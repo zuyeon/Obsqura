@@ -50,15 +50,73 @@ class BLEConnectionManager(
     private val workerHandler = Handler(workerThread.looper)
 
     private val TYPE_KYBER_REQ:   Byte = 0x01
+    private val TYPE_KYBER_CIPHERTEXT: Byte = 0x02
     private val TYPE_AES_MESSAGE: Byte = 0x03   // 암호 텍스트
     private val TYPE_TEXT_PLAIN: Byte = 0x06 // 평문 텍스트
 
     fun getConnectedDevice(): BluetoothDevice? = connectedDevice
 
     companion object {
+        private const val KEY_FILE_PREFIX = "shared_key_"
         val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
         private const val TAG = "BLE_COMM"
+    }
+
+    private fun toastOnMain(msg: String) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        } else {
+            mainHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    private fun keyFileFor(addr: String): File =
+        File(context.filesDir, "$KEY_FILE_PREFIX$addr.bin")
+
+    fun deleteSharedKeysOnLaunch() {
+        context.filesDir.listFiles()?.forEach { f ->
+            if (f.name.startsWith(KEY_FILE_PREFIX)) f.delete()
+        }
+        logCallback?.invoke("🧹 세션 시작: 모든 shared_key_* 삭제")
+    }
+
+    private fun saveSharedKeyFor(addr: String, key: ByteArray) {
+        try {
+            keyFileFor(addr).outputStream().use { it.write(key) }
+            Log.d(TAG, "💾 세션 키 저장 완료 for $addr (${key.size}B)")
+            logCallback?.invoke("💾 세션 키 저장 완료 ($addr)")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ 세션 키 저장 실패", e)
+            logCallback?.invoke("❌ 세션 키 저장 실패: ${e.message}")
+        }
+    }
+
+    private fun loadSharedKeyFor(addr: String?): ByteArray? {
+        if (addr == null) return null
+        return try {
+            val f = keyFileFor(addr)
+            if (!f.exists()) return null
+            val bytes = f.readBytes()
+            if (bytes.size < 32) {
+                logCallback?.invoke("❌ 공유키 길이 비정상 (${bytes.size}B)")
+                null
+            } else bytes
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ shared_key 로드 실패", e)
+            null
+        }
+    }
+
+    private fun deleteSharedKeyFor(addr: String?) {
+        if (addr == null) return
+        try {
+            val f = keyFileFor(addr)
+            if (f.exists()) {
+                f.delete()
+                logCallback?.invoke("🗑️ 세션 키 삭제 ($addr)")
+            }
+        } catch (_: Exception) {}
     }
 
     private fun hasPermission(): Boolean {
@@ -134,6 +192,17 @@ class BLEConnectionManager(
     }
 
     fun sendLargeMessage(rawData: ByteArray, type: Byte, msgId: Byte) {
+        // 🔧 0x03인 경우 키가 있는지 강제 검증
+        if (type == TYPE_AES_MESSAGE) {
+            val addr = connectedDevice?.address
+            val key = loadSharedKeyFor(addr)
+            if (key == null) {
+                logCallback?.invoke("❌ (block) 공유키 없음 → 0x03 전송 차단")
+                toastOnMain("❗ 먼저 공개키 교환을 해주세요.")
+                return
+            }
+        }
+
         // 항상 메인 스레드 보장
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post { sendLargeMessage(rawData, type, msgId) }
@@ -224,7 +293,7 @@ class BLEConnectionManager(
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.d(TAG, "✅ GATT 연결 성공 (status=$status)")
                     mainHandler.post {
-                        Toast.makeText(context, "BLE 연결됨", Toast.LENGTH_SHORT).show()
+                        toastOnMain("BLE 연결됨")
                     }
                     try {
                         gatt.discoverServices()
@@ -234,6 +303,7 @@ class BLEConnectionManager(
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.w(TAG, "⚠️ GATT 연결 끊김 (status=$status)")
+                    deleteSharedKeyFor(connectedDevice?.address)
                     connectedDevice = null
                     mainHandler.post {
                         Toast.makeText(context, "BLE 연결 끊김", Toast.LENGTH_SHORT).show()
@@ -326,6 +396,7 @@ class BLEConnectionManager(
                 Log.w(TAG, "⚠ 새 메시지 시작 또는 msgId 변경 (old=$currentMsgId, new=$msgId). 버퍼 초기화")
                 packetBuffer.clear(); receivedIndices.clear()
                 currentMsgId = msgId.toByte(); currentTotalPackets = total
+                mainHandler.post { receiveProgressCallback?.invoke(0, total)}
             } else if (currentTotalPackets != total) {
                 Log.w(TAG, "⚠ total 변경: $currentTotalPackets -> $total (msgId=$msgId). 버퍼 재설정")
                 packetBuffer.clear(); receivedIndices.clear()
@@ -336,11 +407,17 @@ class BLEConnectionManager(
             if (!receivedIndices.contains(index)) {
                 packetBuffer[index] = packet
                 receivedIndices.add(index)
+                mainHandler.post {
+                    receiveProgressCallback?.invoke(receivedIndices.size, currentTotalPackets) // ✅ 추가
+                }
             } else {
                 Log.w(TAG, "📛 중복 패킷 index=$index 무시")
             }
 
             // --- 4) 완료 조건 ---
+            if (receivedIndices.size == total) {
+                mainHandler.post { receiveProgressCallback?.invoke(total, total) }
+            }
             if (receivedIndices.size != total) return
             val missing = (0 until total).firstOrNull { it !in receivedIndices }
             if (missing != null) { Log.w(TAG, "⚠ 수신 누락 index=$missing"); return }
@@ -390,10 +467,14 @@ class BLEConnectionManager(
                         // 키 저장 + 암호문 전송은 메인 스레드에서
                         mainHandler.post {
                             try {
-                                File(context.filesDir, "shared_key.bin").writeBytes(sharedKey)
-                                Log.d(TAG, "💾 Shared Key 저장 완료")
-                                val newMsgId = (0..255).random().toByte()
-                                sendLargeMessage(ciphertext, type = 0x02, msgId = newMsgId)
+                                val addr = connectedDevice?.address
+                                if (addr == null) {
+                                    logCallback?.invoke("❌ 저장 실패: 디바이스 주소 없음")
+                                } else {
+                                    saveSharedKeyFor(addr, sharedKey) // 🔧 NEW: 디바이스별 저장
+                                }
+                                val newMsgId = newMsgId()
+                                sendLargeMessage(ciphertext, type = TYPE_KYBER_CIPHERTEXT, msgId = newMsgId)
                             } catch (e: Exception) {
                                 Log.e(TAG, "❌ 키 저장/전송 처리 실패", e)
                                 logCallback?.invoke("❌ 키 저장/전송 실패: ${e.message}")
@@ -418,33 +499,23 @@ class BLEConnectionManager(
         }
     }
 
-    private fun loadSharedKey(): ByteArray? {
-        return try {
-            val file = File(context.filesDir, "shared_key.bin")
-            val bytes = file.readBytes()
-            if (bytes.size < 32) {
-                Log.e(TAG, "❌ 공유키 길이 비정상: ${bytes.size}B")
-                logCallback?.invoke("❌ 공유키 길이 비정상 (${bytes.size}B)")
-                null
-            } else bytes
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ shared_key.bin 로드 실패", e)
-            null
-        }
-    }
-
     fun logSharedKey() {
-        val keyFile = File(context.filesDir, "shared_key.bin")
+        val addr = connectedDevice?.address
+        if (addr == null) {
+            Log.e(TAG, "❌ 디바이스 주소 없음")
+            return
+        }
+        val keyFile = keyFileFor(addr)
         if (!keyFile.exists()) {
-            Log.e(TAG, "❌ shared_key.bin 파일이 존재하지 않습니다.")
+            Log.e(TAG, "❌ 세션 키 파일이 없습니다. ($addr)")
             return
         }
         try {
             val keyBytes = keyFile.readBytes()
             val hex = keyBytes.joinToString(" ") { "%02X".format(it) }
-            Log.d(TAG, "🔑 Shared Key (${keyBytes.size}B): $hex")
+            Log.d(TAG, "🔑 Shared Key (${keyBytes.size}B@$addr): $hex")
         } catch (e: Exception) {
-            Log.e(TAG, "❌ shared_key.bin 읽기 실패", e)
+            Log.e(TAG, "❌ 세션 키 읽기 실패", e)
         }
     }
 
@@ -506,21 +577,21 @@ class BLEConnectionManager(
     }
 
     fun sendEncryptedLedCommand(command: String) {
-        val key = loadSharedKey()
+        val key = loadSharedKeyFor(connectedDevice?.address)
         if (key == null) {
             Log.e(TAG, "❌ 공유키 없음 - 암호화 중단")
-            Toast.makeText(context, "❗ 먼저 공개키를 요청해 주세요.", Toast.LENGTH_SHORT).show()
+            toastOnMain("❗ 먼저 공개키를 요청해 주세요.")
             logCallback?.invoke("❌ 공유키 없음 - 먼저 공개키를 요청해 주세요.")
             return
         }
 
         val hexKey = key.joinToString(" ") { "%02X".format(it) }
-        Log.d(TAG, "🔐 [공유키 로그] shared_key.bin: $hexKey")
-        logCallback?.invoke("🔐 공유키(hex): $hexKey")
+        Log.d(TAG, "🔐 [공유키 로그] ${connectedDevice?.address}: $hexKey")
+        logCallback?.invoke("🔐 공유키(hex@${connectedDevice?.address}): $hexKey")
 
         val encrypted = aesGcmEncrypt(command, key) ?: run {
             Log.e(TAG, "❌ 암호화 실패")
-            Toast.makeText(context, "❗ LED 명령 암호화에 실패했습니다.", Toast.LENGTH_SHORT).show()
+            toastOnMain("❗ LED 명령 암호화에 실패했습니다.")
             logCallback?.invoke("❌ 암호화 실패")
             return
         }
@@ -547,49 +618,99 @@ class BLEConnectionManager(
      * ✉️ 평문 텍스트 전송 (암호화 X)
      * 기존 분할/전송 로직: sendLargeMessage(rawData, type, msgId) 재사용
      */
-    fun sendPlainTextMessage(text: String) {
+    // BLEConnectionManager.kt
+    fun sendPlainTextMessage(text: String, mitmOn: Boolean = false) {
         if (text.isBlank()) {
             logCallback?.invoke("❗보낼 텍스트가 비어있습니다.")
             return
         }
-        val payload = text.toByteArray(Charsets.UTF_8)
+
+        var payloadBytes = text.toByteArray(Charsets.UTF_8)
+
+        if (mitmOn) {
+            // 1) 원문을 살짝 변조 (첫 글자 bit-flip 예시)
+            val mutated = payloadBytes.copyOf()
+            if (mutated.isNotEmpty()) {
+                mutated[0] = (mutated[0].toInt() xor 0x01).toByte() // 예: H→I
+            }
+            val mutatedStr = String(mutated, Charsets.UTF_8)
+
+            // 2) ATTACKED + 개행 + 변조문자열 형태로 페이로드 구성
+            val attackedDisplay = "ATTACKED\n$mutatedStr"
+            payloadBytes = attackedDisplay.toByteArray(Charsets.UTF_8)
+
+            // ✅ 로그캣 + 앱 로그 둘 다 출력
+            logCallback?.invoke("⚠️ MITM 변조 적용 → '$mutatedStr' (표시: 'ATTACKED + 개행')")
+            Log.d(TAG, "[SCENARIO][PLAINTEXT] mitm=true, display='${attackedDisplay.replace("\n", "\\n")}'")
+        }
+
         val msgId = newMsgId()
-        logCallback?.invoke("📨 [PLAINTEXT] ${text} (${payload.size}B, msgId=$msgId)")
-        sendLargeMessage(payload, type = TYPE_TEXT_PLAIN, msgId = msgId)
+        logCallback?.invoke("📨 [PLAINTEXT] (${payloadBytes.size}B, msgId=$msgId, mitm=$mitmOn)")
+        sendLargeMessage(payloadBytes, type = TYPE_TEXT_PLAIN, msgId = msgId)
     }
 
-    fun sendEncryptedTextMessage(text: String) {
+    fun sendEncryptedTextMessage(text: String, mitm: Boolean = false) {
         if (text.isBlank()) {
             logCallback?.invoke("❗보낼 텍스트가 비어있습니다.")
+            toastOnMain("❗ 텍스트가 비었습니다.")
             return
         }
-
-        val key = loadSharedKey()
+        val key = loadSharedKeyFor(connectedDevice?.address)
         if (key == null) {
             logCallback?.invoke("❌ 공유키가 없습니다. 먼저 공개키를 요청(KYBER_REQ)하고 키 합의를 완료하세요.")
-            Toast.makeText(context, "❗ 먼저 공개키를 요청해 키 합의를 완료하세요.", Toast.LENGTH_SHORT).show()
+            toastOnMain("❗ 먼저 공개키를 요청해 키 합의를 완료하세요.")
             return
         }
 
-        // 🔎 진단: 입력 평문 바이트 확인
-        val plainBytes = text.toByteArray(Charsets.UTF_8)
-        Log.d("TEXT_DIAG", "PLAIN len=${plainBytes.size}, bytes=${plainBytes.joinToString(" ") { "%02X".format(it) }}")
-        Log.d("TEXT_DIAG", "KEY len=${key.size}")
-
-        val encrypted = aesGcmEncrypt(text, key)
-        if (encrypted == null) {
+        val enc = aesGcmEncrypt(text, key) ?: run {
             logCallback?.invoke("❌ 텍스트 암호화 실패")
-            Toast.makeText(context, "❗ 텍스트 암호화 실패", Toast.LENGTH_SHORT).show()
+            toastOnMain("❗ 텍스트 암호화 실패")
             return
         }
 
-        // 🔎 진단: 포맷/길이/베이스64 확인
-        val b64 = Base64.encodeToString(encrypted, Base64.NO_WRAP)
-        Log.d("TEXT_DIAG", "ENC len=${encrypted.size}, B64=${b64.take(64)}...") // 길면 앞부분만
-        selfTestDecryptAndLog(encrypted, key) // ✅ 앱에서 역복호화 셀프검증
+        // Logcat: 원본 암호문 (일부만)
+        Log.d(TAG, "[SCENARIO][ENCRYPTED] mitm=$mitm msgLen=${text.length}")
+        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc orig=${hexdump(enc)}")
+
+        val encrypted = enc.copyOf()
+        if (mitm) {
+            val ivLen = 12
+            val tagLen = 16
+            if (encrypted.size > ivLen + tagLen) {
+                val i = ivLen // 첫 ciphertext 바이트
+                val before = encrypted[i]
+                encrypted[i] = (before.toInt() xor 0x01).toByte()
+                Log.d(TAG, "⚠️ [MITM] ENCRYPTED bit-flip @ct[0]: ${"%02X".format(before)} -> ${"%02X".format(encrypted[i])}")
+                logCallback?.invoke("⚠️ [MITM] ENCRYPTED ct[0] bit-flip → 수신측 GCM 실패 예상")
+            } else {
+                val before = encrypted[0]
+                encrypted[0] = (before.toInt() xor 0x01).toByte()
+                Log.d(TAG, "⚠️ [MITM] ENCRYPTED bit-flip @0(fallback): ${"%02X".format(before)} -> ${"%02X".format(encrypted[0])}")
+                logCallback?.invoke("⚠️ [MITM] ENCRYPTED 전체 첫 바이트 bit-flip (fallback)")
+            }
+
+            // 로컬에서도 '변조본' 복호를 시도해 GCM 실패 로그 남김 (데모용)
+            try {
+                val nonce = encrypted.copyOfRange(0, 12)
+                val tag   = encrypted.copyOfRange(encrypted.size - 16, encrypted.size)
+                val ct    = encrypted.copyOfRange(12, encrypted.size - 16)
+                val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
+                    javax.crypto.spec.GCMParameterSpec(128, nonce))
+                cipher.doFinal(ct + tag)
+                Log.e(TAG, "[SCENARIO][ENCRYPTED] ⚠️ Expected GCM failure, but decrypt succeeded?!")
+            } catch (e: Exception) {
+                Log.d(TAG, "[SCENARIO][ENCRYPTED] ✅ Expected GCM FAIL (local): ${e::class.simpleName}: ${e.message}")
+            }
+        }
+
+        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc mutated=${hexdump(encrypted)} (if mitm)")
+
+        // 원본(enc)만 셀프검증 OK 로그
+        selfTestDecryptAndLog(enc, key)
 
         val msgId = newMsgId()
-        logCallback?.invoke("🔒 [ENCRYPTED TEXT] 원문(${text.length}자) → 전송바이트(${encrypted.size}B), msgId=$msgId")
+        logCallback?.invoke("🔒 [ENCRYPTED TEXT] 원문(${text.length}자) → 전송바이트(${encrypted.size}B), msgId=$msgId, mitm=$mitm")
         sendLargeMessage(encrypted, type = TYPE_AES_MESSAGE, msgId = msgId)
     }
 
@@ -626,6 +747,20 @@ class BLEConnectionManager(
         }
     }
 
+    private fun hexdump(bytes: ByteArray, limit: Int = 32): String {
+        val shown = bytes.take(limit).toByteArray()
+        val hex = shown.joinToString(" ") { "%02X".format(it) }
+        return if (bytes.size > limit) "$hex …(+${bytes.size - limit}B)" else hex
+    }
+
+    private fun tryUtf8(bytes: ByteArray): String {
+        return try {
+            String(bytes, Charsets.UTF_8)
+        } catch (e: Exception) {
+            "<UTF8 decode fail: ${e::class.simpleName}>"
+        }
+    }
+
     /** 헤더(type|msgId|index|total) + payload 를 단일 write 로 보냄 (total=1) */
     @SuppressLint("MissingPermission")
     fun sendSinglePacket(type: Byte, payload: ByteArray) {
@@ -650,9 +785,13 @@ class BLEConnectionManager(
 
     /** 0x03 타입(암호 패킷 경로)로 'TEST' 단일 패킷 보내기 */
     fun probePacket03Test() {
+        val key = loadSharedKeyFor(connectedDevice?.address)
+        if (key == null) {
+            logCallback?.invoke("❌ (probe) 공유키 없음 → 0x03 테스트 차단")
+            return
+        }
         val payload = "TEST".toByteArray(Charsets.UTF_8)
-        sendSinglePacket(0x03, payload)
+        sendSinglePacket(TYPE_AES_MESSAGE, payload)
     }
-
 
 }

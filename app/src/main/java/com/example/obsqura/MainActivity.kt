@@ -20,6 +20,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
@@ -31,9 +32,15 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.core.app.ActivityCompat
+import androidx.compose.ui.Alignment
+
 import com.example.obsqura.ui.theme.BLECommunicatorTheme
+import com.example.obsqura.ui.test.TestModeScreen
+import com.example.obsqura.ui.scenario.ScenarioModeScreen
 import java.text.SimpleDateFormat
 import java.util.*
+
+enum class AppMode { NONE, TEST, SCENARIO }
 
 class MainActivity : ComponentActivity() {
 
@@ -104,7 +111,6 @@ class MainActivity : ComponentActivity() {
                 lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     }
 
-    // -------- 생명주기 --------
     @SuppressLint("MissingPermission", "ServiceCast")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -120,6 +126,10 @@ class MainActivity : ComponentActivity() {
         var progressTotal by mutableStateOf(0)
         var showProgress by mutableStateOf(false)
 
+        var recvProgressSent by mutableStateOf(0)
+        var recvProgressTotal by mutableStateOf(0)
+        var showRecvProgress by mutableStateOf(false)
+
         fun addLog(msg: String) {
             logMessages = (logMessages + msg).takeLast(100)
             if (msg.contains("LED 명령 전체 전송 완료") || msg.contains("전체 패킷 전송 완료")) {
@@ -127,6 +137,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // 1) 매니저 초기화
         bleConnectionManager = BLEConnectionManager(
             this,
             onPublicKeyReceived = { base64 ->
@@ -134,290 +145,78 @@ class MainActivity : ComponentActivity() {
                 addLog("📥 공개키 수신 완료")
             },
             logCallback = { msg -> addLog(msg) },
-            progressCallback = { sent, total ->   // ✅ 진행률 콜백
+            progressCallback = { sent, total ->
                 progressSent = sent
                 progressTotal = total
                 showProgress = total > 0 && sent < total
-                if (total > 0 && sent >= total) {
-                    showProgress = false
-                }
+                if (total > 0 && sent >= total) showProgress = false
+            },
+            receiveProgressCallback = { received, total ->
+                recvProgressSent = received
+                recvProgressTotal = total
+                showRecvProgress = total > 0 && received < total
+                if (total > 0 && received >= total) showRecvProgress = false
             }
         )
 
+        // 2) 세션 키 일괄 삭제 (초기화 후)
+        bleConnectionManager.deleteSharedKeysOnLaunch()
+
+        // 3) 권한/UI 설정은 onCreate 안에서 계속 진행
         requestPermissionsIfNeeded()
 
         setContent {
             BLECommunicatorTheme {
-                val pink = Color(0xFFE91E63)
-                val green = Color(0xFF4CAF50)
-                val lightGreenBg = Color(0xFFE8F5E9)
+                var appMode by remember { mutableStateOf(AppMode.NONE) }
 
-                var scannedDevices by remember { mutableStateOf<List<CustomBluetoothDevice>>(emptyList()) }
-                var connectedDevice by remember { mutableStateOf<BluetoothDevice?>(null) }
-                var connectedTime by remember { mutableStateOf<String?>(null) }
-                var ledOn by remember { mutableStateOf(false) }
-
-                // === 텍스트 전송 UI에서 사용할 상태 ===
-                var messageText by remember { mutableStateOf("") }
-                // ===================================
-
-                if (showProgress) {
-                    AlertDialog(
-                        onDismissRequest = { /* 전송중에는 닫지 않음 */ },
-                        confirmButton = {},
-                        title = { Text("전송 중…") },
-                        text = {
-                            val pct = if (progressTotal == 0) 0f else progressSent.toFloat() / progressTotal
-                            Column {
-                                LinearProgressIndicator(progress = pct, modifier = Modifier.fillMaxWidth())
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text("${progressSent} / ${progressTotal} 패킷 전송")
-                            }
-                        }
-                    )
+                BackHandler(enabled = true) {
+                    if (appMode == AppMode.NONE) {
+                        finish()
+                    } else {
+                        // 모드 선택 화면 등으로 돌아가기 처리
+                        appMode = AppMode.NONE
+                    }
                 }
 
                 Surface(modifier = Modifier.fillMaxSize(), color = Color.White) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("BLE 스캐너", style = MaterialTheme.typography.headlineMedium.copy(color = pink))
-                        Spacer(modifier = Modifier.height(8.dp))
+                    when (appMode) {
+                        AppMode.NONE -> ModeSelectionScreen(
+                            onSelectTest = { appMode = AppMode.TEST },
+                            onSelectScenario = { appMode = AppMode.SCENARIO }
+                        )
 
-                        connectedDevice?.let { device ->
-                            Text("✅ Connected Device:", color = Color.Black)
-                            Text("• Name: ${device.name ?: "Unknown"}", color = pink)
-                            Text("• Address: ${device.address}", color = pink)
-                            connectedTime?.let { Text("• Connected at: $it", color = pink) }
-                            Spacer(modifier = Modifier.height(12.dp))
-                        }
+                        AppMode.TEST -> TestModeScreen(
+                            ble = bleConnectionManager,
+                            bluetoothAdapter = bluetoothAdapter,
+                            hasScanPermission = { hasScanPermission() },
+                            isLocationEnabled = { isLocationEnabled() },
+                            onRequestPermissions = { requestPermissionsIfNeeded() },
+                            startBleScan = { onFound -> startBleScan(onFound) },
 
-                        // ----- 스캔 버튼 -----
-                        Button(
-                            onClick = {
-                                if (!hasScanPermission()) {
-                                    requestPermissionsIfNeeded()
-                                    Toast.makeText(this@MainActivity, "스캔 권한이 없습니다.", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                if (!isLocationEnabled()) {
-                                    Toast.makeText(this@MainActivity, "휴대폰 위치 서비스를 켜주세요.", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                if (!bluetoothAdapter.isEnabled) {
-                                    startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-                                    return@Button
-                                }
+                            publicKeyBase64 = publicKeyBase64,
+                            logMessages = logMessages,
+                            progressSent = progressSent,
+                            progressTotal = progressTotal,
+                            showProgress = showProgress,
 
-                                scannedDevices = emptyList()
-                                startBleScan { customDevice ->
-                                    scannedDevices = (scannedDevices + customDevice)
-                                        .distinctBy { it.device.address }
-                                        .sortedByDescending {
-                                            it.displayName == "RPi-LED" ||
-                                                    it.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
-                                        }
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = pink)
-                        ) { Text("🔍 BLE 디바이스 스캔") }
+                            recvProgressSent = recvProgressSent,
+                            recvProgressTotal = recvProgressTotal,
+                            showRecvProgress = showRecvProgress,
 
-                        Spacer(modifier = Modifier.height(16.dp))
+                            onBack = { appMode = AppMode.NONE }
+                        )
 
-                        LazyColumn(modifier = Modifier.fillMaxHeight().weight(1f)) {
-                            items(scannedDevices) { customDevice ->
-                                val isRPi = customDevice.displayName == "RPi-LED" ||
-                                        customDevice.device.address.uppercase() == "D8:3A:DD:1E:53:AF"
-
-                                Card(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (isRPi) lightGreenBg else Color.White
-                                    ),
-                                    elevation = CardDefaults.cardElevation(6.dp)
-                                ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Text(
-                                            "이름: ${customDevice.displayName} ${if (isRPi) "🌿 RPi" else ""}",
-                                            color = if (isRPi) green else pink
-                                        )
-                                        Text(
-                                            "주소: ${customDevice.device.address}",
-                                            color = if (isRPi) green else Color.Black
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Row {
-                                            Button(
-                                                onClick = {
-                                                    bleConnectionManager.connect(customDevice.device)
-                                                    connectedDevice = customDevice.device
-                                                    connectedTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                                                },
-                                                modifier = Modifier.padding(end = 8.dp),
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text("🔌 연결") }
-
-                                            Button(
-                                                onClick = {
-                                                    bleConnectionManager.disconnect()
-                                                    connectedDevice = null
-                                                    connectedTime = null
-                                                },
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text("🔌 해제") }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Row {
-                                            Button(
-                                                onClick = { bleConnectionManager.sendRawLedCommand("LED_ON") },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text("🧪 수동 LED ON") }
-
-                                            Spacer(modifier = Modifier.width(8.dp))
-
-                                            Button(
-                                                onClick = { bleConnectionManager.sendRawLedCommand("LED_OFF") },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text("🧪 수동 LED OFF") }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Row {
-                                            Button(
-                                                onClick = {
-                                                    bleConnectionManager.sendEncryptedLedCommand(if (ledOn) "LED_OFF" else "LED_ON")
-                                                    bleConnectionManager.logSharedKey()
-                                                    ledOn = !ledOn
-                                                },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text(if (ledOn) "🌙 암호 LED OFF" else "💡 암호 LED ON") }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Button(
-                                            onClick = {
-                                                // 기존: sendData(..., "KYBER_REQ".toByteArray())
-                                                // 새로: 패킷 분할 방식으로 전송
-                                                bleConnectionManager.sendKyberRequestPacketized()
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = pink),
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) { Text("🔐 공개키 요청") }
-
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Button(
-                                            onClick = {
-                                                val serviceUUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
-                                                val charUUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
-                                                bleConnectionManager.sendData(serviceUUID, charUUID, byteArrayOf(0x04, 0x00, 0x00, 0x01))
-                                            },
-                                            colors = ButtonDefaults.buttonColors(containerColor = pink),
-                                            modifier = Modifier.fillMaxWidth()
-                                        ) { Text("📶 Ping 테스트") }
-
-                                        // === 텍스트 전송 UI 시작 ===
-                                        Spacer(modifier = Modifier.height(16.dp))
-                                        Text("✉️ 텍스트 전송", color = Color.Black)
-                                        OutlinedTextField(
-                                            value = messageText,
-                                            onValueChange = { messageText = it },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            placeholder = { Text("보낼 메시지를 입력하세요", color = Color.Gray) },
-                                            singleLine = true,
-                                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                                            keyboardActions = KeyboardActions(
-                                                onSend = {
-                                                    if (messageText.isNotBlank()) {
-                                                        bleConnectionManager.sendPlainTextMessage(messageText)
-                                                        messageText = ""
-                                                    }
-                                                }
-                                            ),
-                                            // ✅ 입력 글자색을 확실히 지정
-                                            textStyle = LocalTextStyle.current.copy(color = Color.Black),
-                                            // ✅ Material3 TextField 색상 명시
-                                            colors = TextFieldDefaults.colors(
-                                                focusedTextColor = Color.Black,
-                                                unfocusedTextColor = Color.Black,
-                                                disabledTextColor = Color.Black,
-                                                cursorColor = Color.Black,
-
-                                                focusedContainerColor = Color.White,
-                                                unfocusedContainerColor = Color.White,
-                                                disabledContainerColor = Color.White,
-
-                                                focusedIndicatorColor = Color.Black,    // 아웃라인 색
-                                                unfocusedIndicatorColor = Color.Gray,
-
-                                                focusedPlaceholderColor = Color.DarkGray,
-                                                unfocusedPlaceholderColor = Color.Gray
-                                            )
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        Row {
-                                            Button(
-                                                onClick = {
-                                                    if (messageText.isBlank()) {
-                                                        Toast.makeText(this@MainActivity, "메시지를 입력하세요.", Toast.LENGTH_SHORT).show()
-                                                        return@Button
-                                                    }
-                                                    bleConnectionManager.sendPlainTextMessage(messageText)
-                                                    messageText = ""
-                                                },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.buttonColors(containerColor = pink)
-                                            ) { Text("📨 평문 전송") }
-
-                                            Spacer(modifier = Modifier.width(8.dp))
-
-                                            Button(
-                                                onClick = {
-                                                    if (messageText.isBlank()) {
-                                                        Toast.makeText(this@MainActivity, "메시지를 입력하세요.", Toast.LENGTH_SHORT).show()
-                                                        return@Button
-                                                    }
-                                                    bleConnectionManager.sendEncryptedTextMessage(messageText)
-                                                    bleConnectionManager.logSharedKey()
-                                                    messageText = ""
-                                                },
-                                                modifier = Modifier.weight(1f),
-                                                colors = ButtonDefaults.buttonColors(containerColor = green)
-                                            ) { Text("🔒 암호 전송") }
-                                        }
-                                        // === 텍스트 전송 UI 끝 ===
-
-                                        publicKeyBase64?.let {
-                                            Spacer(modifier = Modifier.height(12.dp))
-                                            Text("📄 공개키 (Base64):", color = Color.Black)
-                                            Text(it, color = Color.Black, modifier = Modifier.fillMaxWidth().padding(8.dp))
-                                        }
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
-                                        Text("📜 BLE 로그:", style = MaterialTheme.typography.titleSmall, color = Color.Black)
-                                        LazyColumn(modifier = Modifier.fillMaxWidth().height(120.dp)) {
-                                            items(logMessages) { log -> Text(log, style = MaterialTheme.typography.bodySmall) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        AppMode.SCENARIO -> ScenarioModeScreen(
+                            ble = bleConnectionManager,
+                            onBack = { appMode = AppMode.NONE }
+                        )
                     }
                 }
             }
         }
     }
 
-    // -------- 스캔 제어 --------
+        // -------- 스캔 제어 --------
     @SuppressLint("MissingPermission")
     private fun startBleScan(onFound: (CustomBluetoothDevice) -> Unit) {
         onDeviceFound = onFound
@@ -458,6 +257,29 @@ class MainActivity : ComponentActivity() {
         isScanning = false
         // 바로 재시작 시 2 에러 방지용 쿨다운
         handler.postDelayed({ /* ready */ }, 300)
+    }
+
+    @Composable
+    private fun ModeSelectionScreen(
+        onSelectTest: () -> Unit,
+        onSelectScenario: () -> Unit
+    ) {
+        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
+            Text("모드 선택", style = MaterialTheme.typography.headlineMedium)
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = onSelectTest,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("🔧 일반 테스트 모드") }
+
+            Spacer(Modifier.height(12.dp))
+
+            Button(
+                onClick = onSelectScenario,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("🎭 시나리오 모드") }
+
+        }
     }
 }
 
