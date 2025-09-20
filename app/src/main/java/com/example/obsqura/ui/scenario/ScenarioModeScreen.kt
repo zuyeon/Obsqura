@@ -65,7 +65,7 @@ fun ScenarioModeScreen(
             Spacer(Modifier.width(AppDimens.GapMd))
             FilterChip(selected = secure, onClick = { secure = true }, label = { Text("Secure") })
             Spacer(Modifier.width(AppDimens.GapLg))
-            AssistChip(onClick = { mitmOn = !mitmOn }, label = { Text(if (mitmOn) "🔴 MITM ON" else "🔵 MITM OFF") })
+            AssistChip(onClick = { mitmOn = !mitmOn }, label = { Text(if (mitmOn) "🔴  MITM ON" else "🔵 MITM OFF") })
         }
 
         Spacer(Modifier.height(AppDimens.GapLg))
