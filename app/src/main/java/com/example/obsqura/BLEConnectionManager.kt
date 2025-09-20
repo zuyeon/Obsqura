@@ -7,6 +7,7 @@ package com.example.obsqura
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.*
+import androidx.core.content.ContextCompat
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -62,6 +63,56 @@ class BLEConnectionManager(
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
         private const val TAG = "BLE_COMM"
     }
+
+    fun enableNotifications(
+        context: Context,   // 👈 context를 하나 받도록 수정
+        serviceUUID: UUID,
+        characteristicUUID: UUID,
+        useIndication: Boolean = false
+    ): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        val service = gatt.getService(serviceUUID) ?: return false
+        val characteristic = service.getCharacteristic(characteristicUUID) ?: return false
+
+        val props = characteristic.properties
+        val canNotify = (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
+        val canIndicate = (props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+        if (!canNotify && !canIndicate) return false
+
+        // ====== 🔑 권한 체크 추가 ======
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val ok = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!ok) {
+                // 권한 없으면 Activity에서 requestPermissions() 호출 필요
+                return false
+            }
+        }
+
+        // 1) 로컬 설정 (예외 처리)
+        try {
+            if (!gatt.setCharacteristicNotification(characteristic, true)) return false
+        } catch (se: SecurityException) {
+            se.printStackTrace()
+            return false
+        }
+
+        // 2) CCCD 디스크립터 쓰기
+        val cccdUUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        val descriptor = characteristic.getDescriptor(cccdUUID) ?: return false
+
+        descriptor.value = if (useIndication && canIndicate) {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        }
+
+        return gatt.writeDescriptor(descriptor)
+    }
+
+
 
     private fun toastOnMain(msg: String) {
         if (Looper.myLooper() == Looper.getMainLooper()) {

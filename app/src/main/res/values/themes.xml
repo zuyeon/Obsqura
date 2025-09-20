@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <style name="Theme.Obsqura.Splash" parent="Theme.Material3.DayNight">
+        <item name="windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <!-- 배경을 흰색으로 (원하면 drawable로 로고 포함 배경을 쓸 수도 있음) -->
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
 
     <style name="Theme.BLECommunicator" parent="android:Theme.Material.Light.NoActionBar" />
 </resources>
