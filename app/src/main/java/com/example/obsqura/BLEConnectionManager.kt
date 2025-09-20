@@ -192,7 +192,7 @@ class BLEConnectionManager(
     }
 
     fun sendLargeMessage(rawData: ByteArray, type: Byte, msgId: Byte) {
-        // 🔧 0x03인 경우 키가 있는지 강제 검증
+        // 0x03인 경우 키가 있는지 강제 검증
         if (type == TYPE_AES_MESSAGE) {
             val addr = connectedDevice?.address
             val key = loadSharedKeyFor(addr)
@@ -333,7 +333,7 @@ class BLEConnectionManager(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
-            writeInProgress = false // 🔓 다음 write 허용
+            writeInProgress = false //  다음 write 허용
 
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 logCallback?.invoke("✅ 패킷 $currentSendingIndex 전송 성공 (${currentSendingIndex + 1}/${packetList.size})")
