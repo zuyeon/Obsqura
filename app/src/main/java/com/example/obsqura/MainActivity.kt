@@ -19,26 +19,36 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
-import androidx.core.app.ActivityCompat
 import androidx.compose.ui.Alignment
-
 import com.example.obsqura.ui.theme.BLECommunicatorTheme
+import com.example.obsqura.ui.theme.AppDimens
+import com.example.obsqura.ui.theme.PrimaryButton
+import com.example.obsqura.ui.theme.SecondaryButton
 import com.example.obsqura.ui.test.TestModeScreen
 import com.example.obsqura.ui.scenario.ScenarioModeScreen
 import java.text.SimpleDateFormat
 import java.util.*
+import androidx.compose.foundation.background
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.foundation.Image
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.graphics.Color
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ButtonDefaults
+
 
 enum class AppMode { NONE, TEST, SCENARIO }
 
@@ -53,15 +63,16 @@ class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var onDeviceFound: ((CustomBluetoothDevice) -> Unit)? = null
 
-    // 🔹 ScanCallback은 재사용 (매번 새로 만들면 APPLICATION_REGISTRATION_FAILED(2) 잘 뜸)
+    // 🔹 ScanCallback 재사용 (등록 실패 방지)
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            val rawName: String? = if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                device.name
-            } else {
-                result.scanRecord?.deviceName
-            }
+            val rawName: String? =
+                if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    device.name
+                } else {
+                    result.scanRecord?.deviceName
+                }
             val deviceName = rawName ?: "이름 없음"
             Log.d("BLE_SCAN", "📡 발견: $deviceName (${device.address}), rssi=${result.rssi}")
             onDeviceFound?.invoke(CustomBluetoothDevice(device, deviceName))
@@ -82,7 +93,6 @@ class MainActivity : ComponentActivity() {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
                     checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-                    // 일부 기기에서 여전히 필요
                     checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         } else {
             checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
@@ -91,16 +101,15 @@ class MainActivity : ComponentActivity() {
 
     private fun requestPermissionsIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            requestPermissionsLauncher.launch(arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ))
+            requestPermissionsLauncher.launch(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.ACCESS_FINE_LOCATION
+                )
+            )
         } else {
-            // 🔹 안드9(API 28)에서는 위치 권한 필수
-            requestPermissionsLauncher.launch(arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ))
+            requestPermissionsLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION))
         }
     }
 
@@ -166,19 +175,17 @@ class MainActivity : ComponentActivity() {
         requestPermissionsIfNeeded()
 
         setContent {
-            BLECommunicatorTheme {
+            BLECommunicatorTheme {  // 테마(색/타이포/쉐이프) 적용  :contentReference[oaicite:4]{index=4}
                 var appMode by remember { mutableStateOf(AppMode.NONE) }
 
                 BackHandler(enabled = true) {
-                    if (appMode == AppMode.NONE) {
-                        finish()
-                    } else {
-                        // 모드 선택 화면 등으로 돌아가기 처리
-                        appMode = AppMode.NONE
-                    }
+                    if (appMode == AppMode.NONE) finish() else appMode = AppMode.NONE
                 }
 
-                Surface(modifier = Modifier.fillMaxSize(), color = Color.White) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     when (appMode) {
                         AppMode.NONE -> ModeSelectionScreen(
                             onSelectTest = { appMode = AppMode.TEST },
@@ -192,17 +199,14 @@ class MainActivity : ComponentActivity() {
                             isLocationEnabled = { isLocationEnabled() },
                             onRequestPermissions = { requestPermissionsIfNeeded() },
                             startBleScan = { onFound -> startBleScan(onFound) },
-
                             publicKeyBase64 = publicKeyBase64,
                             logMessages = logMessages,
                             progressSent = progressSent,
                             progressTotal = progressTotal,
                             showProgress = showProgress,
-
                             recvProgressSent = recvProgressSent,
                             recvProgressTotal = recvProgressTotal,
                             showRecvProgress = showRecvProgress,
-
                             onBack = { appMode = AppMode.NONE }
                         )
 
@@ -216,11 +220,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-        // -------- 스캔 제어 --------
+    // -------- 스캔 제어 --------
     @SuppressLint("MissingPermission")
     private fun startBleScan(onFound: (CustomBluetoothDevice) -> Unit) {
         onDeviceFound = onFound
-
         if (isScanning) return
 
         if (!hasScanPermission()) {
@@ -255,32 +258,86 @@ class MainActivity : ComponentActivity() {
         if (!isScanning) return
         bluetoothLeScanner?.let { runCatching { it.stopScan(scanCallback) } }
         isScanning = false
-        // 바로 재시작 시 2 에러 방지용 쿨다운
-        handler.postDelayed({ /* ready */ }, 300)
+        handler.postDelayed({ /* cooldown */ }, 300)
     }
 
+    // ===== 메인 첫 화면: 모드 선택 (UI만 리스킨) =====
     @Composable
     private fun ModeSelectionScreen(
         onSelectTest: () -> Unit,
         onSelectScenario: () -> Unit
     ) {
-        Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
-            Text("모드 선택", style = MaterialTheme.typography.headlineMedium)
-            Spacer(Modifier.height(16.dp))
-            Button(
-                onClick = onSelectTest,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("🔧 일반 테스트 모드") }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = AppDimens.ScreenPadding),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                "Choose your mode",
+                style = MaterialTheme.typography.displaySmall,
+                color = MaterialTheme.colorScheme.onBackground
+            )
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(70.dp))
 
-            Button(
-                onClick = onSelectScenario,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("🎭 시나리오 모드") }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SquareOutlineButton(
+                    label = "TEST",
+                    icon = "🔧",   // 현재 코드에서 쓰는 이모티콘
+                    borderColor = MaterialTheme.colorScheme.primary,
+                    onClick = onSelectTest,
+                    modifier = Modifier
+                        .weight(1f)              // 화면 폭 분할
+                        .aspectRatio(1f)
+                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
+                )
 
+                SquareOutlineButton(
+                    label = "ATTACK",
+                    icon = "🎭",   // 현재 코드에서 쓰는 이모티콘
+                    borderColor = MaterialTheme.colorScheme.secondary,
+                    onClick = onSelectScenario,
+                    modifier = Modifier
+                        .weight(1f)              // 화면 폭 분할
+                        .aspectRatio(1f)
+                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
+                )
+            }
         }
     }
-}
 
-data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)
+    @Composable
+    private fun SquareOutlineButton(
+        label: String,
+        icon: String,
+        borderColor: Color,
+        onClick: () -> Unit,
+        modifier: Modifier = Modifier
+    ) {
+        OutlinedButton(
+            onClick = onClick,
+            modifier = modifier.aspectRatio(1f),   // 정사각형
+            shape = MaterialTheme.shapes.large,
+            border = BorderStroke(2.dp, borderColor),
+            colors = ButtonDefaults.outlinedButtonColors(
+                containerColor = Color.Transparent, // 투명 배경
+                contentColor = borderColor          // 테두리 색 = 텍스트/아이콘 색
+            )
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(icon, fontSize = 50.sp)       // 아이콘 (이모티콘)
+                Spacer(Modifier.height(6.dp))
+                Text(label, style = MaterialTheme.typography.titleMedium)
+            }
+        }
+    }
+
+
+}
+    data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)
