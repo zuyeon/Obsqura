@@ -9,6 +9,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -22,7 +23,6 @@ import com.example.obsqura.CustomBluetoothDevice
 import java.text.SimpleDateFormat
 import java.util.*
 import androidx.compose.material3.OutlinedButton
-
 
 @Composable
 @SuppressLint("MissingPermission")
@@ -48,6 +48,11 @@ fun TestModeScreen(
 ) {
     val context = LocalContext.current
 
+    // 🔄 BLE 연결 상태/자동재연결 토글 (Test 모드에만 노출)
+    val connState by ble.connState.collectAsState()
+    var autoReconn by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(autoReconn) { ble.setAutoReconnectEnabled(autoReconn) }
+
     var scannedDevices by remember { mutableStateOf<List<CustomBluetoothDevice>>(emptyList()) }
     var connectedDevice by remember { mutableStateOf<android.bluetooth.BluetoothDevice?>(null) }
     var connectedTime by remember { mutableStateOf<String?>(null) }
@@ -62,7 +67,7 @@ fun TestModeScreen(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
 
-                // ⬆️ 상단바: 뒤로 / 큰 타이틀
+                // 상단바
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -78,14 +83,13 @@ fun TestModeScreen(
                         "🔧 TEST",
                         style = MaterialTheme.typography.titleLarge,
                         fontSize = 20.sp
-
                     )
                     Spacer(Modifier.width(1.dp))
                 }
 
                 Spacer(Modifier.height(6.dp))
 
-                // "BLE 스캐너" 중앙 정렬 & 크게
+                // 제목
                 Box(
                     modifier = Modifier.fillMaxWidth(),
                     contentAlignment = Alignment.Center
@@ -94,8 +98,43 @@ fun TestModeScreen(
                         "BLE 스캐너",
                         style = MaterialTheme.typography.headlineMedium,
                         fontSize = 24.sp
-
                     )
+                }
+
+                // ✅ 자동 재연결 토글 + 상태 표시 (여기 추가)
+                Spacer(Modifier.height(12.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.large,
+                    tonalElevation = 2.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        // 상태 텍스트
+                        val stateText = when (val s = connState) {
+                            BLEConnectionManager.ConnState.Disconnected -> "🔌 Disconnected"
+                            BLEConnectionManager.ConnState.Connecting -> "⏳ Connecting…"
+                            is BLEConnectionManager.ConnState.Reconnecting ->
+                                "🔄 Reconnecting #${s.attempt} (in ${s.delayMs}ms)"
+                            is BLEConnectionManager.ConnState.Connected ->
+                                if (s.servicesDiscovered) "✅ Connected (Services ready)"
+                                else "✅ Connected (Discovering…)"
+                            is BLEConnectionManager.ConnState.Failed -> "❌ Failed"
+                        }
+                        Text(stateText, style = MaterialTheme.typography.bodyMedium)
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Auto Reconnect", style = MaterialTheme.typography.bodySmall)
+                            Spacer(Modifier.width(8.dp))
+                            Switch(checked = autoReconn, onCheckedChange = { autoReconn = it })
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
@@ -120,7 +159,7 @@ fun TestModeScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                 }
 
-                // 스캔 버튼(크게)
+                // 스캔 버튼
                 Button(
                     onClick = {
                         if (!hasScanPermission()) {
@@ -155,7 +194,7 @@ fun TestModeScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // ✅ 디바이스 리스트 (weight 문제 해결: Box로 감싸기)
+                // 디바이스 리스트
                 Box(modifier = Modifier.weight(1f)) {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
                         items(scannedDevices) { customDevice ->
@@ -328,7 +367,9 @@ fun TestModeScreen(
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
-                                    LazyColumn(modifier = Modifier.fillMaxWidth().height(120.dp)) {
+                                    LazyColumn(modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(120.dp)) {
                                         items(logMessages) { log ->
                                             Text(
                                                 log,
@@ -345,7 +386,7 @@ fun TestModeScreen(
             }
         }
 
-        // ✅ 수신 진행률 오버레이
+        // 수신 진행률 오버레이
         if (showRecvProgress) {
             Surface(
                 color = MaterialTheme.colorScheme.inverseSurface,
@@ -375,7 +416,7 @@ fun TestModeScreen(
             }
         }
 
-        // ✅ 전송 진행 다이얼로그
+        // 전송 진행 다이얼로그
         if (showProgress) {
             AlertDialog(
                 onDismissRequest = { /* 전송중에는 닫지 않음 */ },

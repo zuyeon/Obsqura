@@ -19,6 +19,10 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import kotlin.math.ceil
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlin.math.min
 import java.io.File
 import java.security.SecureRandom
 import java.util.*
@@ -44,6 +48,7 @@ class BLEConnectionManager(
     private var sendingMsgId: Byte = 0
     private var sendingType: Byte = 0
     private val packetRetryMap = mutableMapOf<Int, Int>()  // index -> retryCount
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // threading
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -54,6 +59,30 @@ class BLEConnectionManager(
     private val TYPE_KYBER_CIPHERTEXT: Byte = 0x02
     private val TYPE_AES_MESSAGE: Byte = 0x03   // 암호 텍스트
     private val TYPE_TEXT_PLAIN: Byte = 0x06 // 평문 텍스트
+
+    @Volatile private var autoReconnectEnabled = true
+    @Volatile private var userInitiatedDisconnect = false
+
+    private var lastDeviceAddress: String? = null
+    private var reconnectJob: Job? = null
+    private var reconnectAttempt = 0
+
+    // 백오프 파라미터
+    private val RECONNECT_BASE_DELAY_MS = 1000L   // 1초
+    private val RECONNECT_MAX_DELAY_MS  = 10000L  // 10초
+    private val RECONNECT_MAX_ATTEMPTS  = 8       // 필요시 조정
+
+    // UI에서 구독 가능한 연결 상태
+    sealed class ConnState {
+        data object Disconnected: ConnState()
+        data object Connecting: ConnState()
+        data class Reconnecting(val attempt: Int, val delayMs: Long): ConnState()
+        data class Connected(val servicesDiscovered: Boolean): ConnState()
+        data class Failed(val code: Int): ConnState()
+    }
+
+    private val _connState = MutableStateFlow<ConnState>(ConnState.Disconnected)
+    val connState: StateFlow<ConnState> = _connState
 
     fun getConnectedDevice(): BluetoothDevice? = connectedDevice
 
@@ -112,6 +141,21 @@ class BLEConnectionManager(
         return gatt.writeDescriptor(descriptor)
     }
 
+    @SuppressLint("MissingPermission")
+    private fun deviceFromAddress(addr: String): BluetoothDevice? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasPermission()) {
+            Log.e(TAG, "BLUETOOTH_CONNECT 권한 없음 → deviceFromAddress 반환 null")
+            return null
+        }
+        return try {
+            val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val ad = bm.adapter ?: return null
+            ad.getRemoteDevice(addr)
+        } catch (e: Exception) {
+            Log.e(TAG, "deviceFromAddress($addr) 실패: ${e.message}")
+            null
+        }
+    }
 
 
     private fun toastOnMain(msg: String) {
@@ -120,6 +164,16 @@ class BLEConnectionManager(
         } else {
             mainHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
         }
+    }
+
+    fun setAutoReconnectEnabled(enabled: Boolean) {
+        autoReconnectEnabled = enabled
+        if (!enabled) cancelReconnect()
+    }
+
+    private fun cancelReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = null
     }
 
     private fun keyFileFor(addr: String): File =
@@ -185,6 +239,12 @@ class BLEConnectionManager(
             return
         }
         try {
+            userInitiatedDisconnect = false
+            autoReconnectEnabled = true
+            lastDeviceAddress = device.address
+            reconnectAttempt = 0
+            _connState.value = ConnState.Connecting
+
             bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
             connectedDevice = device
         } catch (e: SecurityException) {
@@ -192,16 +252,22 @@ class BLEConnectionManager(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun disconnect() {
         if (!hasPermission()) {
             Log.e(TAG, "disconnect 권한 없음")
             return
         }
         try {
+            userInitiatedDisconnect = true
+            autoReconnectEnabled = false
+            cancelReconnect()
+
             bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
             bluetoothGatt = null
             connectedDevice = null
+            _connState.value = ConnState.Disconnected
             Log.d(TAG, "🔌 GATT 연결 해제")
         } catch (e: SecurityException) {
             Log.e(TAG, "disconnect 권한 오류", e)
@@ -339,13 +405,16 @@ class BLEConnectionManager(
 
     @Suppress("DEPRECATION")
     private val gattCallback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.d(TAG, "✅ GATT 연결 성공 (status=$status)")
-                    mainHandler.post {
-                        toastOnMain("BLE 연결됨")
-                    }
+                    reconnectAttempt = 0
+                    cancelReconnect()
+                    _connState.value = ConnState.Connected(servicesDiscovered = false)
+
+                    mainHandler.post { toastOnMain("BLE 연결됨") }
                     try {
                         gatt.discoverServices()
                     } catch (e: SecurityException) {
@@ -356,17 +425,25 @@ class BLEConnectionManager(
                     Log.w(TAG, "⚠️ GATT 연결 끊김 (status=$status)")
                     deleteSharedKeyFor(connectedDevice?.address)
                     connectedDevice = null
-                    mainHandler.post {
-                        Toast.makeText(context, "BLE 연결 끊김", Toast.LENGTH_SHORT).show()
-                    }
+                    _connState.value = ConnState.Disconnected
+                    mainHandler.post { Toast.makeText(context, "BLE 연결 끊김", Toast.LENGTH_SHORT).show() }
+
+                    // 비정상/원치않은 끊김이면 자동 재연결
+                    val abnormal = (status != BluetoothGatt.GATT_SUCCESS) || !userInitiatedDisconnect
+                    if (abnormal) scheduleReconnect()
                 }
                 else -> Log.d(TAG, "ℹ️ GATT 상태 변경: newState=$newState, status=$status")
             }
         }
 
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "✅ 서비스 검색 성공")
+                _connState.value = ConnState.Connected(servicesDiscovered = true)
+                reconnectAttempt = 0
+                cancelReconnect()
+
                 enableNotification()
                 gatt.services.forEach { service ->
                     Log.d(TAG, "🔧 Service UUID: ${service.uuid}")
@@ -376,6 +453,8 @@ class BLEConnectionManager(
                 }
             } else {
                 Log.e(TAG, "서비스 검색 실패: status=$status")
+                // 서비스 검색 실패도 재연결 시도
+                scheduleReconnect()
             }
         }
 
@@ -844,5 +923,51 @@ class BLEConnectionManager(
         val payload = "TEST".toByteArray(Charsets.UTF_8)
         sendSinglePacket(TYPE_AES_MESSAGE, payload)
     }
+
+    @SuppressLint("MissingPermission")
+    private fun scheduleReconnect() {
+        if (!autoReconnectEnabled) return
+        if (userInitiatedDisconnect) return
+
+        val address = lastDeviceAddress ?: return
+        if (reconnectJob?.isActive == true) return
+        if (reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+            _connState.value = ConnState.Failed(code = -1)
+            Log.e(TAG, "자동 재연결 한계 도달")
+            return
+        }
+
+        val delayMs = min(RECONNECT_BASE_DELAY_MS * (1L shl reconnectAttempt), RECONNECT_MAX_DELAY_MS)
+        _connState.value = ConnState.Reconnecting(reconnectAttempt + 1, delayMs)
+
+        reconnectJob = scope.launch {
+            delay(delayMs)
+
+            // 권한 가드
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasPermission()) {
+                Log.e(TAG, "권한 없음 → 재연결 스킵")
+                return@launch
+            }
+
+            // 안전하게 정리 후 재시도
+            try {
+                bluetoothGatt?.disconnect()
+                bluetoothGatt?.close()
+            } catch (_: Exception) {}
+            bluetoothGatt = null
+
+            val dev = deviceFromAddress(address)
+            if (dev == null) {
+                Log.e(TAG, "재연결용 디바이스 복원 실패 → 다음 사이클")
+                reconnectAttempt++
+                scheduleReconnect()
+                return@launch
+            }
+            reconnectAttempt++
+            _connState.value = ConnState.Connecting
+            connect(dev) // 아래 connect에 이미 권한 가드 있음
+        }
+    }
+
 
 }

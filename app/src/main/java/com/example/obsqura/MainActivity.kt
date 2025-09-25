@@ -58,6 +58,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var bleConnectionManager: BLEConnectionManager
     private var bluetoothLeScanner: BluetoothLeScanner? = null
 
+    private var ws: WsClient? = null
+
     // 🔹 스캔 상태/핸들러/콜백을 "전역 1개"만 유지
     private var isScanning = false
     private val handler = Handler(Looper.getMainLooper())
@@ -175,6 +177,15 @@ class MainActivity : ComponentActivity() {
         requestPermissionsIfNeeded()
 
         setContent {
+            val wsUrl = "ws://172.30.1.8:8765/ws"
+            ws = WsClient(
+                url = wsUrl,
+                onOpen = { runOnUiThread { Log.d("WS", "OPEN (ui)") } },
+                onFail = { err -> runOnUiThread { Log.e("WS", "FAIL: $err") } },
+                onText = { text -> runOnUiThread { Log.d("WS", "RX: $text") } }
+            )
+            ws?.connect()
+
             BLECommunicatorTheme {  // 테마(색/타이포/쉐이프) 적용  :contentReference[oaicite:4]{index=4}
                 var appMode by remember { mutableStateOf(AppMode.NONE) }
 
@@ -189,7 +200,12 @@ class MainActivity : ComponentActivity() {
                     when (appMode) {
                         AppMode.NONE -> ModeSelectionScreen(
                             onSelectTest = { appMode = AppMode.TEST },
-                            onSelectScenario = { appMode = AppMode.SCENARIO }
+                            onSelectScenario = { appMode = AppMode.SCENARIO },
+                            onSelectProxy = {
+                                val text = "HELLO_FROM_APP"
+                                ws?.sendBytes(text.toByteArray(Charsets.UTF_8), mode = "legacy")
+                                Toast.makeText(this@MainActivity, "프록시로 전송: $text", Toast.LENGTH_SHORT).show()
+                            }
                         )
 
                         AppMode.TEST -> TestModeScreen(
@@ -219,6 +235,12 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ws?.close()
+    }
+
 
     // -------- 스캔 제어 --------
     @SuppressLint("MissingPermission")
@@ -265,7 +287,8 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun ModeSelectionScreen(
         onSelectTest: () -> Unit,
-        onSelectScenario: () -> Unit
+        onSelectScenario: () -> Unit,
+        onSelectProxy: () -> Unit,
     ) {
         Column(
             modifier = Modifier
@@ -283,30 +306,40 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(70.dp))
 
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(20.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),   // 좌우 여백
+                horizontalArrangement = Arrangement.spacedBy(16.dp),  // 버튼 간격
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 SquareOutlineButton(
                     label = "TEST",
-                    icon = "🔧",   // 현재 코드에서 쓰는 이모티콘
+                    icon = "🔧",
                     borderColor = MaterialTheme.colorScheme.primary,
                     onClick = onSelectTest,
                     modifier = Modifier
-                        .weight(1f)              // 화면 폭 분할
-                        .aspectRatio(1f)
-                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
+                        .weight(1f)      // 폭 1/3씩 균등 분할
+                        .aspectRatio(1f) // 정사각형 유지
                 )
 
                 SquareOutlineButton(
                     label = "ATTACK",
-                    icon = "🎭",   // 현재 코드에서 쓰는 이모티콘
+                    icon = "🎭",
                     borderColor = MaterialTheme.colorScheme.secondary,
                     onClick = onSelectScenario,
                     modifier = Modifier
-                        .weight(1f)              // 화면 폭 분할
+                        .weight(1f)
                         .aspectRatio(1f)
-                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
+                )
+
+                SquareOutlineButton(
+                    label = "PROXY",
+                    icon = "⚠️",
+                    borderColor = MaterialTheme.colorScheme.tertiary,
+                    onClick = onSelectProxy,   // 함수 따로 연결 가능
+                    modifier = Modifier
+                        .weight(1f)
+                        .aspectRatio(1f)
                 )
             }
         }
