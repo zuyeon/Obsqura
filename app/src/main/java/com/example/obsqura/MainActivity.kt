@@ -38,6 +38,7 @@ import com.example.obsqura.ui.theme.PrimaryButton
 import com.example.obsqura.ui.theme.SecondaryButton
 import com.example.obsqura.ui.test.TestModeScreen
 import com.example.obsqura.ui.scenario.ScenarioModeScreen
+import com.example.obsqura.ui.proxy.ProxyModeScreen
 import java.text.SimpleDateFormat
 import java.util.*
 import androidx.compose.foundation.background
@@ -48,17 +49,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ButtonDefaults
+import com.example.obsqura.WsClient
 
-
-enum class AppMode { NONE, TEST, SCENARIO }
+enum class AppMode { NONE, TEST, SCENARIO, PROXY }
 
 class MainActivity : ComponentActivity() {
+
+    private var proxyClient: ProxyClient? = null
 
     private lateinit var bluetoothAdapter: BluetoothAdapter
     private lateinit var bleConnectionManager: BLEConnectionManager
     private var bluetoothLeScanner: BluetoothLeScanner? = null
-
-    private var ws: WsClient? = null
 
     // 🔹 스캔 상태/핸들러/콜백을 "전역 1개"만 유지
     private var isScanning = false
@@ -141,6 +142,8 @@ class MainActivity : ComponentActivity() {
         var recvProgressTotal by mutableStateOf(0)
         var showRecvProgress by mutableStateOf(false)
 
+        WsClient.start(ProxyConfig.PROXY_WS_URL)
+
         fun addLog(msg: String) {
             logMessages = (logMessages + msg).takeLast(100)
             if (msg.contains("LED 명령 전체 전송 완료") || msg.contains("전체 패킷 전송 완료")) {
@@ -167,7 +170,8 @@ class MainActivity : ComponentActivity() {
                 recvProgressTotal = total
                 showRecvProgress = total > 0 && received < total
                 if (total > 0 && received >= total) showRecvProgress = false
-            }
+            },
+            wsClient = WsClient
         )
 
         // 2) 세션 키 일괄 삭제 (초기화 후)
@@ -177,15 +181,6 @@ class MainActivity : ComponentActivity() {
         requestPermissionsIfNeeded()
 
         setContent {
-            val wsUrl = "ws://172.30.1.8:8765/ws"
-            ws = WsClient(
-                url = wsUrl,
-                onOpen = { runOnUiThread { Log.d("WS", "OPEN (ui)") } },
-                onFail = { err -> runOnUiThread { Log.e("WS", "FAIL: $err") } },
-                onText = { text -> runOnUiThread { Log.d("WS", "RX: $text") } }
-            )
-            ws?.connect()
-
             BLECommunicatorTheme {  // 테마(색/타이포/쉐이프) 적용  :contentReference[oaicite:4]{index=4}
                 var appMode by remember { mutableStateOf(AppMode.NONE) }
 
@@ -201,11 +196,7 @@ class MainActivity : ComponentActivity() {
                         AppMode.NONE -> ModeSelectionScreen(
                             onSelectTest = { appMode = AppMode.TEST },
                             onSelectScenario = { appMode = AppMode.SCENARIO },
-                            onSelectProxy = {
-                                val text = "HELLO_FROM_APP"
-                                ws?.sendBytes(text.toByteArray(Charsets.UTF_8), mode = "legacy")
-                                Toast.makeText(this@MainActivity, "프록시로 전송: $text", Toast.LENGTH_SHORT).show()
-                            }
+                            onSelectProxy = { appMode = AppMode.PROXY }
                         )
 
                         AppMode.TEST -> TestModeScreen(
@@ -230,17 +221,33 @@ class MainActivity : ComponentActivity() {
                             ble = bleConnectionManager,
                             onBack = { appMode = AppMode.NONE }
                         )
+
+                        AppMode.PROXY -> {
+                            // 프록시 모드 진입 시 프록시 클라이언트 시작 (한 번만)
+                            LaunchedEffect(Unit) {
+                                if (proxyClient == null) {
+                                    proxyClient = ProxyClient("ws://100.76.136.25:8080/ws") // 프록시2 URL이면 여기 교체
+                                    proxyClient?.start()
+                                }
+                            }
+
+                            // ✅ 인자에서 proxyClient 빼세요
+                            ProxyModeScreen(
+                                proxyClient = proxyClient,
+                                onBack = {
+                                    proxyClient?.stop()
+                                    proxyClient = null
+                                    appMode = AppMode.NONE
+                                }
+                            )
+                        }
+
+
                     }
                 }
             }
         }
     }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        ws?.close()
-    }
-
 
     // -------- 스캔 제어 --------
     @SuppressLint("MissingPermission")
@@ -288,7 +295,7 @@ class MainActivity : ComponentActivity() {
     private fun ModeSelectionScreen(
         onSelectTest: () -> Unit,
         onSelectScenario: () -> Unit,
-        onSelectProxy: () -> Unit,
+        onSelectProxy: () -> Unit
     ) {
         Column(
             modifier = Modifier
@@ -306,10 +313,8 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(70.dp))
 
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),   // 좌우 여백
-                horizontalArrangement = Arrangement.spacedBy(16.dp),  // 버튼 간격
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(20.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 SquareOutlineButton(
@@ -318,8 +323,9 @@ class MainActivity : ComponentActivity() {
                     borderColor = MaterialTheme.colorScheme.primary,
                     onClick = onSelectTest,
                     modifier = Modifier
-                        .weight(1f)      // 폭 1/3씩 균등 분할
-                        .aspectRatio(1f) // 정사각형 유지
+                        .weight(1f)
+                        .aspectRatio(1f)
+                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
                 )
 
                 SquareOutlineButton(
@@ -330,16 +336,18 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier
                         .weight(1f)
                         .aspectRatio(1f)
+                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
                 )
 
                 SquareOutlineButton(
                     label = "PROXY",
-                    icon = "⚠️",
+                    icon = "🛰️",
                     borderColor = MaterialTheme.colorScheme.tertiary,
-                    onClick = onSelectProxy,   // 함수 따로 연결 가능
+                    onClick = onSelectProxy,
                     modifier = Modifier
                         .weight(1f)
                         .aspectRatio(1f)
+                        .sizeIn(maxWidth = 100.dp, maxHeight = 100.dp)
                 )
             }
         }
@@ -371,6 +379,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-
+    override fun onDestroy() {
+        super.onDestroy()
+        WsClient.stop()
+        proxyClient?.stop()
+    }
 }
-    data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)
+data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)

@@ -29,13 +29,19 @@ import java.util.*
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import com.example.obsqura.ProxyConfig
+import com.example.obsqura.WsClient
+import com.example.obsqura.ProxyClient
+
 
 class BLEConnectionManager(
     private val context: Context,
     private val onPublicKeyReceived: (String) -> Unit,
     private val logCallback: ((String) -> Unit)? = null,
     private val progressCallback: ((sent: Int, total: Int) -> Unit)? = null,
-    private val receiveProgressCallback: ((received: Int, total: Int) -> Unit)? = null
+    private val receiveProgressCallback: ((received: Int, total: Int) -> Unit)? = null,
+    private val wsClient: WsClient? = null,   // ← 새로 추가 (nullable)
+
 ) {
     private var bluetoothGatt: BluetoothGatt? = null
     private val packetBuffer = mutableMapOf<Int, ByteArray>()
@@ -50,6 +56,10 @@ class BLEConnectionManager(
     private val packetRetryMap = mutableMapOf<Int, Int>()  // index -> retryCount
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    // === Proxy2(중계) 지원 ===
+    private var proxyClient: ProxyClient? = null
+    @Volatile var proxyMode: Boolean = false   // true면 프록시2 경유
+
     // threading
     private val mainHandler = Handler(Looper.getMainLooper())
     private val workerThread = HandlerThread("kyber-worker").apply { start() }
@@ -62,6 +72,7 @@ class BLEConnectionManager(
 
     @Volatile private var autoReconnectEnabled = true
     @Volatile private var userInitiatedDisconnect = false
+    @Volatile var mitmEnabled: Boolean = false
 
     private var lastDeviceAddress: String? = null
     private var reconnectJob: Job? = null
@@ -72,13 +83,14 @@ class BLEConnectionManager(
     private val RECONNECT_MAX_DELAY_MS  = 10000L  // 10초
     private val RECONNECT_MAX_ATTEMPTS  = 8       // 필요시 조정
 
+
     // UI에서 구독 가능한 연결 상태
     sealed class ConnState {
-        data object Disconnected: ConnState()
-        data object Connecting: ConnState()
-        data class Reconnecting(val attempt: Int, val delayMs: Long): ConnState()
-        data class Connected(val servicesDiscovered: Boolean): ConnState()
-        data class Failed(val code: Int): ConnState()
+        object Disconnected : ConnState()
+        object Connecting : ConnState()
+        data class Reconnecting(val attempt: Int, val delayMs: Long) : ConnState()
+        data class Connected(val servicesDiscovered: Boolean) : ConnState()
+        data class Failed(val code: Int) : ConnState()
     }
 
     private val _connState = MutableStateFlow<ConnState>(ConnState.Disconnected)
@@ -91,6 +103,48 @@ class BLEConnectionManager(
         val SERVICE_UUID: UUID = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
         private const val TAG = "BLE_COMM"
+        private const val SC_TAG = "SCENARIO"
+        private const val SC_EMOJI = "🧪"
+    }
+
+    // ---- 시나리오 로그 헬퍼 (BLE_COMM 한 태그만 사용) ----
+    private fun scLog(msg: String) {
+        val line = "🧪 $msg"
+        logCallback?.invoke(line)   // 앱 내부 로그 패널
+        Log.d(TAG, line)            // 오직 BLE_COMM 태그
+    }
+
+    private fun scHeader(mode: String, mitm: Boolean): String {
+        val lock = if (mode == "SECURE") "🔒" else "🆓"
+        val mitmFlag = if (mitm) "MITM=ON" else "MITM=OFF"
+        return "$SC_EMOJI $lock [$mode/$mitmFlag]"
+    }
+
+    private fun scHex(bytes: ByteArray, limit: Int = 32): String {
+        val shown = bytes.take(limit).toByteArray()
+        val hex = shown.joinToString(" ") { "%02X".format(it) }
+        return if (bytes.size > limit) "$hex …(+${bytes.size - limit}B)" else hex
+    }
+
+    /* === 웹소켓 연결 시작 (생성자로 전달된 wsClient 사용) === */
+    init {
+        wsClient?.let { client ->
+            try {
+                // ProxyConfig.PROXY_WS_URL 을 사용하도록 (정적설정)
+                client.start(ProxyConfig.PROXY_WS_URL)
+                Log.d(TAG, "WsClient.start() 호출 시도: ${ProxyConfig.PROXY_WS_URL}")
+            } catch (e: Exception) {
+                Log.w(TAG, "WsClient start() 실패: ${e.message}")
+            }
+        }
+    }
+
+
+
+    fun setProxyClient(pc: ProxyClient?) {
+        proxyClient?.removeListener(proxyListener)
+        proxyClient = pc
+        pc?.addListener(proxyListener)
     }
 
     fun enableNotifications(
@@ -139,6 +193,34 @@ class BLEConnectionManager(
         }
 
         return gatt.writeDescriptor(descriptor)
+    }
+
+
+    // 헤더(type|msgId|index|total 4바이트) 제거하고 이어붙임
+    private fun reassemblePackets(packets: Map<Int, ByteArray>): ByteArray {
+        val sorted = packets.toSortedMap()
+        val out = ArrayList<Byte>()
+        for ((_, p) in sorted) out.addAll(p.drop(4))
+        return out.toByteArray()
+    }
+
+
+    // 프록시2(WebSocket)에서 들어오는 메시지 → BLE 수신과 동일 로직으로 처리
+    private val proxyListener = object : ProxyClient.Listener {
+        override fun onRawText(msg: String) {
+            runCatching {
+                val j = org.json.JSONObject(msg)
+                if (j.optString("kind") == "relay" && j.has("payload_b64")) {
+                    val b64 = j.getString("payload_b64")
+                    val bytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+                    val dir = j.optString("direction", "proxy->app")
+                    processIncomingPacket(bytes, dir)
+                }
+            }
+        }
+        override fun onRawBinary(bytes: ByteArray) {
+            processIncomingPacket(bytes, "proxy->app")
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -326,6 +408,7 @@ class BLEConnectionManager(
             return
         }
 
+
         val payloadSize = 16
         val totalPackets = ceil(rawData.size / payloadSize.toDouble()).toInt()
         sendingType = type
@@ -358,6 +441,75 @@ class BLEConnectionManager(
         val packet = packetList[index]
         val retryCount = packetRetryMap.getOrDefault(index, 0)
 
+        // ➊ 프록시2 경유 모드라면 → BLE write 대신 WS 중계
+        if (proxyMode) {
+            // (a) 뷰어(프록시1)에는 복사본 계속 보내기
+            runCatching {
+                wsClient?.sendCopy(
+                    direction = "app->proxy", // 라벨만 바꿔서 구분 (원하면 app->rpi 유지도 가능)
+                    mode = when (sendingType) {
+                        TYPE_TEXT_PLAIN -> "legacy"
+                        TYPE_AES_MESSAGE -> "secure"
+                        TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
+                        else -> "unknown"
+                    },
+                    payloadBytes = packet,
+                    sessionId = connectedDevice?.address,
+                    seq = (sendingMsgId.toInt() and 0xFF),
+                    mitm = mitmEnabled
+                )
+            }
+
+            // (b) 실제 전송은 프록시2로 릴레이
+            val ok = proxyClient?.sendRelayPacket(
+                packet20 = packet,
+                typeHint = when (sendingType) {
+                    TYPE_TEXT_PLAIN -> "legacy"
+                    TYPE_AES_MESSAGE -> "secure"
+                    TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
+                    else -> "unknown"
+                }
+            ) == true
+
+            if (!ok) {
+                logCallback?.invoke("⚠️ Proxy2 릴레이 실패(idx=$index) - 재시도 예정")
+                mainHandler.postDelayed({ sendPacketAt(index) }, 200)
+                return
+            }
+
+            // (c) 진행률/다음 패킷 스케줄 (BLE write 콜백이 없으므로 직접 업데이트)
+            logCallback?.invoke("🌐 Proxy2로 패킷 전송 성공 idx=$index/${packetList.size}")
+            progressCallback?.let { it(index + 1, packetList.size) }
+            currentSendingIndex = index + 1
+            if (currentSendingIndex < packetList.size) {
+                mainHandler.postDelayed({ sendPacketAt(currentSendingIndex) }, 60)
+            } else {
+                logCallback?.invoke("✅ 전체 패킷 전송 완료 (msgId=$sendingMsgId, via Proxy2)")
+                val failed = packetRetryMap.count { it.value >= 2 }
+                val retried = packetRetryMap.count { it.value > 1 }
+                val total = packetList.size
+                logCallback?.invoke("📊 전송률 통계: 전체 $total 개 중 ${total - failed} 개 성공 / $failed 개 실패 / $retried 개 재시도 이상")
+            }
+            return
+        }
+
+        // ➋ 일반 모드(BLE 직접)일 땐 기존 로직 유지
+        runCatching {
+            wsClient?.sendCopy(
+                direction = "app->rpi",
+                mode = when (sendingType) {
+                    TYPE_TEXT_PLAIN -> "legacy"
+                    TYPE_AES_MESSAGE -> "secure"
+                    TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
+                    else -> "unknown"
+                },
+                payloadBytes = packet,
+                sessionId = connectedDevice?.address,
+                seq = (sendingMsgId.toInt() and 0xFF),
+                mitm = mitmEnabled
+            )
+        }
+
         if (retryCount >= 3) {
             Log.e(TAG, "❌ 패킷 $index 전송 3회 실패 - 전송 중단")
             logCallback?.invoke("❌ 패킷 $index 전송 3회 실패 - 전송 중단")
@@ -370,7 +522,7 @@ class BLEConnectionManager(
 
         packetRetryMap[index] = retryCount + 1
         logCallback?.invoke("📤 전송중: idx=$index (재시도 ${retryCount + 1}/3)")
-        sendDataWithRetry(packet)
+        sendDataWithRetry(packet) // ← BLE write
     }
 
     fun enableNotification(serviceUUID: UUID = SERVICE_UUID, charUUID: UUID = CHARACTERISTIC_UUID) {
@@ -494,139 +646,155 @@ class BLEConnectionManager(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            // --- 0) 입력값/길이 가드 ---
             val packet = characteristic.value ?: run {
-                Log.e(TAG, "❌ characteristic.value == null")
+                Log.e(TAG, "❌ characteristic.value == null"); return
+            }
+            // 그대로 호출만
+            processIncomingPacket(
+                packet = packet,
+                direction = "rpi->app",
+                sendCopyRawChunk = false
+            )
+        }
+    }
+
+    // BLE/Proxy 공통 처리. 네 기존 로그를 통째로 보존해서 붙여 넣는 컨테이너 함수.
+    private fun processIncomingPacket(
+        packet: ByteArray,
+        direction: String = "rpi->app",
+        sendCopyRawChunk: Boolean = false      // 조각(raw)도 뷰어에 보낼지 옵션
+    ) {
+        // ── (A) 여기: 원본 조각 그대로 “옵션”으로 뷰어에 복사 ─────────────────────────────
+        if (sendCopyRawChunk) {
+            runCatching {
+                wsClient?.sendCopy(
+                    direction = direction,                 // "rpi->app" 등
+                    mode = modeForType((packet[0].toInt() and 0xFF).toByte()),
+                    payloadBytes = packet,                 // 헤더포함 “원 조각”
+                    sessionId = connectedDevice?.address,
+                    seq = (packet[2].toInt() and 0xFF)     // index
+                )
+            }
+        }
+        // ───────────────────────────────────────────────────────────────────────────────
+
+        // ── (B) ↓↓↓↓↓↓↓↓↓↓↓↓ 여기에 “네 onCharacteristicChanged 본문”을 그대로 붙여 넣는다 ↓↓↓↓↓↓↓↓↓↓↓↓
+        // --- 0) 입력값/길이 가드 ---
+        if (packet.size < 4) {
+            Log.e(TAG, "❌ 잘못된 패킷 길이=${packet.size} (<4)")
+            return
+        }
+
+        // --- 1) 헤더 파싱 ---
+        val type  = packet[0].toInt() and 0xFF
+        val msgId = packet[1].toInt() and 0xFF
+        val index = packet[2].toInt() and 0xFF
+        val total = packet[3].toInt() and 0xFF
+
+        Log.d(TAG, "📥 패킷 수신: type=$type, msgId=$msgId, index=$index/$total, len=${packet.size}")
+
+        if (total <= 0 || total > 255) { Log.e(TAG, "❌ 비정상 total=$total → 패킷 무시"); return }
+        if (index >= total) { Log.e(TAG, "❌ 인덱스 범위 초과: index=$index / total=$total"); return }
+
+        // --- 2) 새 메시지 시작/ID 변경 처리 ---
+        val curMsgIdInt = currentMsgId?.toInt() ?: -1
+        if (currentMsgId == null || msgId != curMsgIdInt) {
+            Log.w(TAG, "⚠ 새 메시지 시작 또는 msgId 변경 (old=$currentMsgId, new=$msgId). 버퍼 초기화")
+            packetBuffer.clear(); receivedIndices.clear()
+            currentMsgId = msgId.toByte(); currentTotalPackets = total
+            mainHandler.post { receiveProgressCallback?.invoke(0, total) }
+        } else if (currentTotalPackets != total) {
+            Log.w(TAG, "⚠ total 변경: $currentTotalPackets -> $total (msgId=$msgId). 버퍼 재설정")
+            packetBuffer.clear(); receivedIndices.clear()
+            currentTotalPackets = total
+        }
+
+        // --- 3) 패킷 저장 ---
+        if (!receivedIndices.contains(index)) {
+            packetBuffer[index] = packet
+            receivedIndices.add(index)
+            mainHandler.post { receiveProgressCallback?.invoke(receivedIndices.size, currentTotalPackets) }
+        } else {
+            Log.w(TAG, "📛 중복 패킷 index=$index 무시")
+        }
+
+        // --- 4) 완료 조건 ---
+        if (receivedIndices.size == total) {
+            mainHandler.post { receiveProgressCallback?.invoke(total, total) }
+        }
+        if (receivedIndices.size != total) return
+        val missing = (0 until total).firstOrNull { it !in receivedIndices }
+        if (missing != null) { Log.w(TAG, "⚠ 수신 누락 index=$missing"); return }
+
+        // --- 5) 재조립 + 공개키 처리 (JNI는 워커 스레드) ---
+        try {
+            Log.d(TAG, "📦 모든 패킷($total) 수신 완료. 재조립 시작 (msgId=$msgId)")
+            val payload = reassemblePackets(packetBuffer) // 네가 쓰던 함수 그대로
+
+            // ── (C) 여기: “조립본”을 뷰어에 복사 (사람이 보기 좋게 헤더 제거된 바이트) ─────────────
+            runCatching {
+                wsClient?.sendCopy(
+                    direction = direction,
+                    mode = modeForType(type.toByte()),
+                    payloadBytes = payload,            // 헤더 제거 + 조립 결과
+                    sessionId = connectedDevice?.address,
+                    seq = msgId
+                )
+            }
+            // ───────────────────────────────────────────────────────────────────────────
+
+            // 수신 상태 초기화
+            packetBuffer.clear(); receivedIndices.clear()
+            currentMsgId = null; currentTotalPackets = -1
+
+            // ─────────────────────────
+            // ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓
+            // “네가 기존에 하던 공개키 길이/형태 체크 + 저장 + encapsulate + shared_key 저장 + ct 전송”
+            // 그대로 유지 (로그도 그대로)
+            val base64Len = Base64.encodeToString(payload, Base64.NO_WRAP).length
+            Log.d(TAG, "🧩 복원된 공개키(Base64) 길이=$base64Len")
+            logCallback?.invoke("📩 공개키 수신 완료")
+
+            // 공개키 판별: 길이/형태 기반(추천)
+            val looksLikePubKey = payload.size in 700..1100 && isLikelyKyberKey(payload)
+            if (!looksLikePubKey) {
+                // 공개키가 아니면 기존 로직대로 종료/분기
                 return
             }
-            if (packet.size < 4) {
-                Log.e(TAG, "❌ 잘못된 패킷 길이=${packet.size} (<4)")
-                return
-            }
 
-            // --- 1) 헤더 파싱 ---
-            val type  = packet[0].toInt() and 0xFF
-            val msgId = packet[1].toInt() and 0xFF
-            val index = packet[2].toInt() and 0xFF
-            val total = packet[3].toInt() and 0xFF
+            try { File(context.filesDir, "received_publickey_raw.bin").writeBytes(payload) } catch (_: Exception) {}
 
-            Log.d(TAG, "📥 패킷 수신: type=$type, msgId=$msgId, index=$index/$total, len=${packet.size}")
-
-            // total/인덱스 체크
-            if (total <= 0 || total > 255) {
-                Log.e(TAG, "❌ 비정상 total=$total → 패킷 무시"); return
-            }
-            if (index >= total) {
-                Log.e(TAG, "❌ 인덱스 범위 초과: index=$index / total=$total"); return
-            }
-
-            // --- 2) 새 메시지 시작/ID 변경 처리 ---
-            val curMsgIdInt = currentMsgId?.toInt() ?: -1
-            if (currentMsgId == null || msgId != curMsgIdInt) {
-                Log.w(TAG, "⚠ 새 메시지 시작 또는 msgId 변경 (old=$currentMsgId, new=$msgId). 버퍼 초기화")
-                packetBuffer.clear(); receivedIndices.clear()
-                currentMsgId = msgId.toByte(); currentTotalPackets = total
-                mainHandler.post { receiveProgressCallback?.invoke(0, total)}
-            } else if (currentTotalPackets != total) {
-                Log.w(TAG, "⚠ total 변경: $currentTotalPackets -> $total (msgId=$msgId). 버퍼 재설정")
-                packetBuffer.clear(); receivedIndices.clear()
-                currentTotalPackets = total
-            }
-
-            // --- 3) 패킷 저장 ---
-            if (!receivedIndices.contains(index)) {
-                packetBuffer[index] = packet
-                receivedIndices.add(index)
-                mainHandler.post {
-                    receiveProgressCallback?.invoke(receivedIndices.size, currentTotalPackets) // ✅ 추가
-                }
-            } else {
-                Log.w(TAG, "📛 중복 패킷 index=$index 무시")
-            }
-
-            // --- 4) 완료 조건 ---
-            if (receivedIndices.size == total) {
-                mainHandler.post { receiveProgressCallback?.invoke(total, total) }
-            }
-            if (receivedIndices.size != total) return
-            val missing = (0 until total).firstOrNull { it !in receivedIndices }
-            if (missing != null) { Log.w(TAG, "⚠ 수신 누락 index=$missing"); return }
-
-            // --- 5) 재조립 + 공개키 처리 (JNI는 워커 스레드) ---
-            try {
-                Log.d(TAG, "📦 모든 패킷($total) 수신 완료. 재조립 시작 (msgId=$msgId)")
-                val pubkey = reassemblePackets(packetBuffer) // 헤더 제거 후 합침
-
-                // 수신 상태 초기화
-                packetBuffer.clear(); receivedIndices.clear()
-                currentMsgId = null; currentTotalPackets = -1
-
-                // 디버깅용 로그(길이만)
-                val base64Len = Base64.encodeToString(pubkey, Base64.NO_WRAP).length
-                Log.d(TAG, "🧩 복원된 공개키(Base64) 길이=$base64Len")
-                logCallback?.invoke("📩 공개키 수신 완료")
-
-                if (pubkey.size != 800) {
-                    Log.e(TAG, "❌ 공개키 길이 비정상: ${pubkey.size}B")
-                    logCallback?.invoke("❌ 공개키 길이 오류 (${pubkey.size}B)")
-                    return
-                }
-                if (!isLikelyKyberKey(pubkey)) {
-                    Log.e(TAG, "❌ 수신 데이터가 Kyber 공개키로 보이지 않음")
-                    logCallback?.invoke("❌ 유효하지 않은 공개키")
-                    return
-                }
-
-                // (선택) raw 공개키 저장
+            workerHandler.post {
                 try {
-                    File(context.filesDir, "received_publickey_raw.bin").writeBytes(pubkey)
-                } catch (saveErr: Exception) {
-                    Log.e(TAG, "❌ 공개키 저장 실패", saveErr)
-                }
+                    val result = KyberJNI.encapsulate(payload)
+                    val ciphertext = result.ciphertext
+                    val sharedKey  = result.sharedKey
 
-                // JNI는 워커 스레드에서
-                workerHandler.post {
-                    try {
-                        val result = KyberJNI.encapsulate(pubkey)
-                        val ciphertext = result.ciphertext
-                        val sharedKey  = result.sharedKey
+                    Log.d(TAG, "✅ Encapsulation 완료 - ct=${ciphertext.size}B, key=${sharedKey.size}B")
+                    logCallback?.invoke("✅ Encapsulation 완료 (ct=${ciphertext.size}B, key=${sharedKey.size}B)")
 
-                        Log.d(TAG, "✅ Encapsulation 완료 - ct=${ciphertext.size}B, key=${sharedKey.size}B")
-                        logCallback?.invoke("✅ Encapsulation 완료 (ct=${ciphertext.size}B, key=${sharedKey.size}B)")
-
-                        // 키 저장 + 암호문 전송은 메인 스레드에서
-                        mainHandler.post {
-                            try {
-                                val addr = connectedDevice?.address
-                                if (addr == null) {
-                                    logCallback?.invoke("❌ 저장 실패: 디바이스 주소 없음")
-                                } else {
-                                    saveSharedKeyFor(addr, sharedKey) // 🔧 NEW: 디바이스별 저장
-                                }
-                                val newMsgId = newMsgId()
-                                sendLargeMessage(ciphertext, type = TYPE_KYBER_CIPHERTEXT, msgId = newMsgId)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "❌ 키 저장/전송 처리 실패", e)
-                                logCallback?.invoke("❌ 키 저장/전송 실패: ${e.message}")
-                            }
+                    mainHandler.post {
+                        try {
+                            connectedDevice?.address?.let { saveSharedKeyFor(it, sharedKey) }
+                            sendLargeMessage(ciphertext, type = TYPE_KYBER_CIPHERTEXT, msgId = newMsgId())
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ 키 저장/전송 처리 실패", e)
+                            logCallback?.invoke("❌ 키 저장/전송 실패: ${e.message}")
                         }
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "❌ Encapsulation 실패/크래시 감지", t)
-                        logCallback?.invoke("❌ Encapsulation 실패: ${t.message}")
                     }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "❌ Encapsulation 실패/크래시 감지", t)
+                    logCallback?.invoke("❌ Encapsulation 실패: ${t.message}")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ 공개키 재조립/처리 중 예외", e)
-                logCallback?.invoke("❌ 공개키 처리 실패: ${e.message}")
             }
-        }
+            // ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+            // ─────────────────────────
 
-        private fun reassemblePackets(packets: Map<Int, ByteArray>): ByteArray {
-            val sorted = packets.toSortedMap()
-            val result = mutableListOf<Byte>()
-            for ((_, p) in sorted) result.addAll(p.drop(4)) // 4-byte header 제거
-            return result.toByteArray()
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ 공개키 재조립/처리 중 예외", e)
+            logCallback?.invoke("❌ 공개키 처리 실패: ${e.message}")
         }
+        // ── (B) ↑↑↑↑↑↑↑↑↑↑↑↑ 여기까지가 “네 onCharacteristicChanged 본문” (거의 그대로)
     }
 
     fun logSharedKey() {
@@ -748,37 +916,43 @@ class BLEConnectionManager(
      * ✉️ 평문 텍스트 전송 (암호화 X)
      * 기존 분할/전송 로직: sendLargeMessage(rawData, type, msgId) 재사용
      */
-    // BLEConnectionManager.kt
+
+    // ✉️ 평문(LEGACY)
     fun sendPlainTextMessage(text: String, mitmOn: Boolean = false) {
         if (text.isBlank()) {
             logCallback?.invoke("❗보낼 텍스트가 비어있습니다.")
             return
         }
 
-        var payloadBytes = text.toByteArray(Charsets.UTF_8)
+        val header = scHeader("LEGACY", mitmOn)
+
+        // 시나리오 헤더 + 원문 프리뷰
+        scLog("$header  [PLAINTEXT] len=${text.length}")
+        Log.d(TAG, "[SCENARIO][PLAINTEXT] mitm=$mitmOn msgLen=${text.length}")
+        Log.d(TAG, "[SCENARIO][PLAINTEXT] orig preview='${text.take(40)}${if (text.length > 40) "…" else ""}'")
+
+        var payload = text.toByteArray(Charsets.UTF_8)
 
         if (mitmOn) {
-            // 1) 원문을 살짝 변조 (첫 글자 bit-flip 예시)
-            val mutated = payloadBytes.copyOf()
-            if (mutated.isNotEmpty()) {
-                mutated[0] = (mutated[0].toInt() xor 0x01).toByte() // 예: H→I
-            }
-            val mutatedStr = String(mutated, Charsets.UTF_8)
+            val mutated = payload.copyOf()
+            if (mutated.isNotEmpty()) mutated[0] = (mutated[0].toInt() xor 0x01).toByte() // 1비트 flip
+            val attackedDisplay = "ATTACKED\n" + String(mutated, Charsets.UTF_8)
+            payload = attackedDisplay.toByteArray(Charsets.UTF_8)
 
-            // 2) ATTACKED + 개행 + 변조문자열 형태로 페이로드 구성
-            val attackedDisplay = "ATTACKED\n$mutatedStr"
-            payloadBytes = attackedDisplay.toByteArray(Charsets.UTF_8)
-
-            // ✅ 로그캣 + 앱 로그 둘 다 출력
-            logCallback?.invoke("⚠️ MITM 변조 적용 → '$mutatedStr' (표시: 'ATTACKED + 개행')")
-            Log.d(TAG, "[SCENARIO][PLAINTEXT] mitm=true, display='${attackedDisplay.replace("\n", "\\n")}'")
+            scLog("$header  ⚠️ PLAINTEXT 변조 적용 (bit-flip @char[0])")
+            Log.d(TAG, "[SCENARIO][PLAINTEXT] mutated preview='${attackedDisplay.replace("\n","\\n").take(60)}${if (attackedDisplay.length > 60) "…" else ""}'")
+        } else {
+            scLog("$header  PLAINTEXT 전송")
         }
 
         val msgId = newMsgId()
-        logCallback?.invoke("📨 [PLAINTEXT] (${payloadBytes.size}B, msgId=$msgId, mitm=$mitmOn)")
-        sendLargeMessage(payloadBytes, type = TYPE_TEXT_PLAIN, msgId = msgId)
+        scLog("$header  BYTES=${payload.size}B, msgId=$msgId")
+        logCallback?.invoke("📨 [PLAINTEXT] (${payload.size}B, msgId=$msgId, mitm=$mitmOn)")
+        sendLargeMessage(payload, type = TYPE_TEXT_PLAIN, msgId = msgId)
     }
 
+
+    // 🔐 암호(SECURE)
     fun sendEncryptedTextMessage(text: String, mitm: Boolean = false) {
         if (text.isBlank()) {
             logCallback?.invoke("❗보낼 텍스트가 비어있습니다.")
@@ -792,57 +966,58 @@ class BLEConnectionManager(
             return
         }
 
+        val header = scHeader("SECURE", mitm)
         val enc = aesGcmEncrypt(text, key) ?: run {
             logCallback?.invoke("❌ 텍스트 암호화 실패")
             toastOnMain("❗ 텍스트 암호화 실패")
             return
         }
 
-        // Logcat: 원본 암호문 (일부만)
-        Log.d(TAG, "[SCENARIO][ENCRYPTED] mitm=$mitm msgLen=${text.length}")
-        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc orig=${hexdump(enc)}")
+        scLog("$header  msgLen=${text.length}")
+        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc orig=${scHex(enc)}")
 
         val encrypted = enc.copyOf()
         if (mitm) {
             val ivLen = 12
             val tagLen = 16
             if (encrypted.size > ivLen + tagLen) {
-                val i = ivLen // 첫 ciphertext 바이트
+                val i = ivLen
                 val before = encrypted[i]
                 encrypted[i] = (before.toInt() xor 0x01).toByte()
-                Log.d(TAG, "⚠️ [MITM] ENCRYPTED bit-flip @ct[0]: ${"%02X".format(before)} -> ${"%02X".format(encrypted[i])}")
+                scLog("$header  ⚠️ ENCRYPTED bit-flip @ct[0]")
                 logCallback?.invoke("⚠️ [MITM] ENCRYPTED ct[0] bit-flip → 수신측 GCM 실패 예상")
             } else {
                 val before = encrypted[0]
                 encrypted[0] = (before.toInt() xor 0x01).toByte()
-                Log.d(TAG, "⚠️ [MITM] ENCRYPTED bit-flip @0(fallback): ${"%02X".format(before)} -> ${"%02X".format(encrypted[0])}")
-                logCallback?.invoke("⚠️ [MITM] ENCRYPTED 전체 첫 바이트 bit-flip (fallback)")
+                scLog("$header  ⚠️ ENCRYPTED bit-flip @0(fallback)")
             }
 
-            // 로컬에서도 '변조본' 복호를 시도해 GCM 실패 로그 남김 (데모용)
             try {
                 val nonce = encrypted.copyOfRange(0, 12)
                 val tag   = encrypted.copyOfRange(encrypted.size - 16, encrypted.size)
                 val ct    = encrypted.copyOfRange(12, encrypted.size - 16)
                 val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"),
-                    javax.crypto.spec.GCMParameterSpec(128, nonce))
+                cipher.init(
+                    javax.crypto.Cipher.DECRYPT_MODE,
+                    javax.crypto.spec.SecretKeySpec(key, "AES"),
+                    javax.crypto.spec.GCMParameterSpec(128, nonce)
+                )
                 cipher.doFinal(ct + tag)
                 Log.e(TAG, "[SCENARIO][ENCRYPTED] ⚠️ Expected GCM failure, but decrypt succeeded?!")
             } catch (e: Exception) {
-                Log.d(TAG, "[SCENARIO][ENCRYPTED] ✅ Expected GCM FAIL (local): ${e::class.simpleName}: ${e.message}")
+                scLog("$header  ✅ Expected GCM FAIL (local): ${e::class.simpleName}")
             }
         }
 
-        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc mutated=${hexdump(encrypted)} (if mitm)")
-
-        // 원본(enc)만 셀프검증 OK 로그
+        Log.d(TAG, "[SCENARIO][ENCRYPTED] enc mutated=${scHex(encrypted)}")
         selfTestDecryptAndLog(enc, key)
 
         val msgId = newMsgId()
+        scLog("$header  BYTES=${encrypted.size}B, msgId=$msgId")
         logCallback?.invoke("🔒 [ENCRYPTED TEXT] 원문(${text.length}자) → 전송바이트(${encrypted.size}B), msgId=$msgId, mitm=$mitm")
         sendLargeMessage(encrypted, type = TYPE_AES_MESSAGE, msgId = msgId)
     }
+
 
     /** 🔐 공개키 요청을 패킷(헤더 포함)으로 전송 */
     fun sendKyberRequestPacketized() {
@@ -969,5 +1144,13 @@ class BLEConnectionManager(
         }
     }
 
+    /* === ADD: 모드 매핑 헬퍼 === */
+    private fun modeForType(type: Byte): String = when (type) {
+        TYPE_TEXT_PLAIN      -> "legacy"
+        TYPE_AES_MESSAGE     -> "secure"
+        TYPE_KYBER_REQ,
+        TYPE_KYBER_CIPHERTEXT-> "secure-handshake"
+        else                 -> "unknown"
+    }
 
 }
