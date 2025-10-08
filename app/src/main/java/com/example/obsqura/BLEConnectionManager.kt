@@ -40,7 +40,7 @@ class BLEConnectionManager(
     private val logCallback: ((String) -> Unit)? = null,
     private val progressCallback: ((sent: Int, total: Int) -> Unit)? = null,
     private val receiveProgressCallback: ((received: Int, total: Int) -> Unit)? = null,
-    private val wsClient: WsClient? = null,   // ← 새로 추가 (nullable)
+    private val wsClient: WsClient? = null   // ← 새로 추가 (nullable)
 
 ) {
     private var bluetoothGatt: BluetoothGatt? = null
@@ -59,6 +59,11 @@ class BLEConnectionManager(
     // === Proxy2(중계) 지원 ===
     private var proxyClient: ProxyClient? = null
     @Volatile var proxyMode: Boolean = false   // true면 프록시2 경유
+    private var proxySessionId: String = "proxy-session" // 프록시 경유 시 키 파일 ownerId
+
+    // ...아래에 헬퍼 추가
+    private fun keyOwnerId(): String? =
+        if (proxyMode) proxySessionId else connectedDevice?.address
 
     // threading
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -83,6 +88,10 @@ class BLEConnectionManager(
     private val RECONNECT_MAX_DELAY_MS  = 10000L  // 10초
     private val RECONNECT_MAX_ATTEMPTS  = 8       // 필요시 조정
 
+    // === 연결 워치독/스캔 보관 ===
+    private var connectionWatchdog: Job? = null
+    private var bleScanner: android.bluetooth.le.BluetoothLeScanner? = null
+    private var scanCallback: android.bluetooth.le.ScanCallback? = null
 
     // UI에서 구독 가능한 연결 상태
     sealed class ConnState {
@@ -95,6 +104,12 @@ class BLEConnectionManager(
 
     private val _connState = MutableStateFlow<ConnState>(ConnState.Disconnected)
     val connState: StateFlow<ConnState> = _connState
+
+    private var proxyMirror: ((direction: String, packet20: ByteArray, type: Byte) -> Unit)? = null
+
+    fun attachProxyMirror(mirror: ((String, ByteArray, Byte) -> Unit)?) {
+        proxyMirror = mirror
+    }
 
     fun getConnectedDevice(): BluetoothDevice? = connectedDevice
 
@@ -139,7 +154,31 @@ class BLEConnectionManager(
         }
     }
 
+    fun copySharedKeyFromAddressToProxySession(sourceAddr: String): Boolean {
+        val src = keyFileFor(sourceAddr)
+        val dst = keyFileFor(proxySessionId) // setProxySessionId(...)로 바꾼 값 또는 기본 "proxy-session"
+        return try {
+            if (!src.exists()) {
+                logCallback?.invoke("❌ 기존 키 파일이 없습니다: ${src.name}")
+                false
+            } else {
+                src.copyTo(dst, overwrite = true)
+                logCallback?.invoke("✅ 기존 키를 프록시 세션으로 복사: ${src.name} → ${dst.name}")
+                true
+            }
+        } catch (e: Exception) {
+            logCallback?.invoke("❌ 키 복사 실패: ${e.message}")
+            false
+        }
+    }
 
+    // 멤버 변수 추가
+    @Volatile private var keepKeysAcrossDisconnects: Boolean = false
+
+    // 외부에서 설정할 수 있게 세터 제공
+    fun setKeepSharedKeyOnNextDisconnect(keep: Boolean) {
+        keepKeysAcrossDisconnects = keep
+    }
 
     fun setProxyClient(pc: ProxyClient?) {
         proxyClient?.removeListener(proxyListener)
@@ -239,6 +278,44 @@ class BLEConnectionManager(
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private fun safeDisconnectAndClose(reason: String = "") {
+        try {
+            Log.w(TAG, "safeDisconnectAndClose: $reason")
+            connectionWatchdog?.cancel()
+            connectionWatchdog = null
+            bluetoothGatt?.let { g ->
+                try { g.disconnect() } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+    }
+
+    /** 실제 자원 해제 + 상태 초기화 */
+    @SuppressLint("MissingPermission")
+    private fun finalizeCloseAndClear() {
+        try {
+            bluetoothGatt?.let { g ->
+                try { g.close() } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+        bluetoothGatt = null
+        connectedDevice = null
+        writeInProgress = false
+        packetList = emptyList()
+        packetRetryMap.clear()
+    }
+
+    /** GATT 캐시 초기화(가능한 기기에서만 동작) */
+    @SuppressLint("DiscouragedPrivateApi")
+    private fun refreshDeviceCache(gatt: BluetoothGatt?): Boolean {
+        return try {
+            val m = gatt?.javaClass?.getMethod("refresh")
+            m?.isAccessible = true
+            (m?.invoke(gatt) as? Boolean) ?: false
+        } catch (t: Throwable) {
+            Log.w(TAG, "refreshDeviceCache failed", t); false
+        }
+    }
 
     private fun toastOnMain(msg: String) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -332,7 +409,84 @@ class BLEConnectionManager(
         } catch (e: SecurityException) {
             Log.e(TAG, "connectGatt 권한 오류", e)
         }
+
+        // ⬇ 연결 워치독 (10초 내 Connected+Services OK가 아니면 강제 리셋)
+        connectionWatchdog?.cancel()
+        connectionWatchdog = scope.launch(Dispatchers.Main) {
+            delay(10_000)
+            if (bluetoothGatt != null && _connState.value !is ConnState.Connected) {
+                Log.w(TAG, "Connect timeout → force reset")
+                try { refreshDeviceCache(bluetoothGatt) } catch (_: Exception) {}
+                finalizeCloseAndClear()
+                scheduleReconnect()
+            }
+        }
+
     }
+
+    @SuppressLint("MissingPermission")
+    fun connectByScanOnce(
+        targetName: String? = null,
+        targetServiceUuid: UUID? = null,
+        scanWindowMs: Long = 8000
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !hasPermission()) {
+            Log.e(TAG, "권한 없음 → connectByScanOnce 취소")
+            return
+        }
+
+        // 이전 연결/스캔 정리
+        safeDisconnectAndClose("connectByScanOnce")
+        finalizeCloseAndClear()
+
+        val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val ad = bm.adapter ?: run { Log.e(TAG, "BT 어댑터 없음"); return }
+        bleScanner = ad.bluetoothLeScanner ?: run { Log.e(TAG, "BLE 스캐너 없음"); return }
+
+        val filters = mutableListOf<android.bluetooth.le.ScanFilter>()
+        targetName?.let {
+            filters += android.bluetooth.le.ScanFilter.Builder().setDeviceName(it).build()
+        }
+        targetServiceUuid?.let {
+            filters += android.bluetooth.le.ScanFilter.Builder()
+                .setServiceUuid(android.os.ParcelUuid(it)).build()
+        }
+
+        val settings = android.bluetooth.le.ScanSettings.Builder()
+            .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        var stopped = false
+        scanCallback = object : android.bluetooth.le.ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: android.bluetooth.le.ScanResult) {
+                val d = result.device ?: return
+                if (targetName != null && d.name != targetName) return
+                if (!stopped) {
+                    stopped = true
+                    try { bleScanner?.stopScan(this) } catch (_: Exception) {}
+                    scanCallback = null
+                    connect(d) // 기존 connect(device) 재사용
+                }
+            }
+            override fun onScanFailed(errorCode: Int) {
+                Log.e(TAG, "Scan failed: $errorCode")
+            }
+        }
+
+        bleScanner?.startScan(if (filters.isEmpty()) null else filters, settings, scanCallback)
+
+        // 타임아웃
+        mainHandler.postDelayed({
+            if (!stopped) {
+                stopped = true
+                try { scanCallback?.let { bleScanner?.stopScan(it) } } catch (_: Exception) {}
+                scanCallback = null
+                Log.w(TAG, "스캔 타임아웃")
+                scheduleReconnect()
+            }
+        }, scanWindowMs)
+    }
+
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
@@ -351,6 +505,8 @@ class BLEConnectionManager(
             connectedDevice = null
             _connState.value = ConnState.Disconnected
             Log.d(TAG, "🔌 GATT 연결 해제")
+            connectionWatchdog?.cancel()
+            connectionWatchdog = null
         } catch (e: SecurityException) {
             Log.e(TAG, "disconnect 권한 오류", e)
         }
@@ -393,14 +549,14 @@ class BLEConnectionManager(
     fun sendLargeMessage(rawData: ByteArray, type: Byte, msgId: Byte) {
         // 0x03인 경우 키가 있는지 강제 검증
         if (type == TYPE_AES_MESSAGE) {
-            val addr = connectedDevice?.address
-            val key = loadSharedKeyFor(addr)
+            val key = loadSharedKeyFor(keyOwnerId())
             if (key == null) {
                 logCallback?.invoke("❌ (block) 공유키 없음 → 0x03 전송 차단")
                 toastOnMain("❗ 먼저 공개키 교환을 해주세요.")
                 return
             }
         }
+
 
         // 항상 메인 스레드 보장
         if (Looper.myLooper() != Looper.getMainLooper()) {
@@ -441,12 +597,12 @@ class BLEConnectionManager(
         val packet = packetList[index]
         val retryCount = packetRetryMap.getOrDefault(index, 0)
 
-        // ➊ 프록시2 경유 모드라면 → BLE write 대신 WS 중계
+        // ✅ Proxy2 경유 모드
         if (proxyMode) {
-            // (a) 뷰어(프록시1)에는 복사본 계속 보내기
+            // (1) 프록시1(뷰어)에도 계속 복사본 보내기
             runCatching {
                 wsClient?.sendCopy(
-                    direction = "app->proxy", // 라벨만 바꿔서 구분 (원하면 app->rpi 유지도 가능)
+                    direction = "app->proxy", // 라벨만 바꿔서 구분
                     mode = when (sendingType) {
                         TYPE_TEXT_PLAIN -> "legacy"
                         TYPE_AES_MESSAGE -> "secure"
@@ -454,13 +610,13 @@ class BLEConnectionManager(
                         else -> "unknown"
                     },
                     payloadBytes = packet,
-                    sessionId = connectedDevice?.address,
+                    sessionId = keyOwnerId(), // 연결주소 대신 세션ID
                     seq = (sendingMsgId.toInt() and 0xFF),
                     mitm = mitmEnabled
                 )
             }
 
-            // (b) 실제 전송은 프록시2로 릴레이
+            // (2) 실제 중계는 Proxy2로
             val ok = proxyClient?.sendRelayPacket(
                 packet20 = packet,
                 typeHint = when (sendingType) {
@@ -477,7 +633,7 @@ class BLEConnectionManager(
                 return
             }
 
-            // (c) 진행률/다음 패킷 스케줄 (BLE write 콜백이 없으므로 직접 업데이트)
+            // (3) BLE write 콜백이 없으므로 진행률/다음 패킷을 직접 갱신
             logCallback?.invoke("🌐 Proxy2로 패킷 전송 성공 idx=$index/${packetList.size}")
             progressCallback?.let { it(index + 1, packetList.size) }
             currentSendingIndex = index + 1
@@ -493,23 +649,7 @@ class BLEConnectionManager(
             return
         }
 
-        // ➋ 일반 모드(BLE 직접)일 땐 기존 로직 유지
-        runCatching {
-            wsClient?.sendCopy(
-                direction = "app->rpi",
-                mode = when (sendingType) {
-                    TYPE_TEXT_PLAIN -> "legacy"
-                    TYPE_AES_MESSAGE -> "secure"
-                    TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
-                    else -> "unknown"
-                },
-                payloadBytes = packet,
-                sessionId = connectedDevice?.address,
-                seq = (sendingMsgId.toInt() and 0xFF),
-                mitm = mitmEnabled
-            )
-        }
-
+        // ➌ 아래는 기존 BLE write 로직 그대로
         if (retryCount >= 3) {
             Log.e(TAG, "❌ 패킷 $index 전송 3회 실패 - 전송 중단")
             logCallback?.invoke("❌ 패킷 $index 전송 3회 실패 - 전송 중단")
@@ -559,34 +699,64 @@ class BLEConnectionManager(
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.d(TAG, "onConnectionStateChange status=$status newState=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.d(TAG, "✅ GATT 연결 성공 (status=$status)")
-                    reconnectAttempt = 0
-                    cancelReconnect()
-                    _connState.value = ConnState.Connected(servicesDiscovered = false)
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        reconnectAttempt = 0
+                        cancelReconnect()
+                        _connState.value = ConnState.Connected(servicesDiscovered = false)
+                        mainHandler.post { toastOnMain("BLE 연결됨") }
 
-                    mainHandler.post { toastOnMain("BLE 연결됨") }
-                    try {
-                        gatt.discoverServices()
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "discoverServices 권한 오류", e)
+                        // 연결 이후 워치독: discoverServices가 멈추면 리셋
+                        connectionWatchdog?.cancel()
+                        connectionWatchdog = scope.launch(Dispatchers.Main) {
+                            delay(10_000)
+                            Log.w(TAG, "Connect watchdog timeout → reset")
+                            try { refreshDeviceCache(gatt) } catch (_: Exception) {}
+                            finalizeCloseAndClear()
+                            scheduleReconnect()
+                        }
+
+                        try { gatt.discoverServices() } catch (e: SecurityException) {
+                            Log.e(TAG, "discoverServices 권한 오류", e)
+                        }
+                    } else {
+                        // 연결은 되었으나 status가 비정상 → 리셋 후 재시도
+                        mainHandler.post {
+                            try { refreshDeviceCache(gatt) } catch (_: Exception) {}
+                            finalizeCloseAndClear()
+                            scheduleReconnect()
+                        }
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.w(TAG, "⚠️ GATT 연결 끊김 (status=$status)")
-                    deleteSharedKeyFor(connectedDevice?.address)
-                    connectedDevice = null
-                    _connState.value = ConnState.Disconnected
-                    mainHandler.post { Toast.makeText(context, "BLE 연결 끊김", Toast.LENGTH_SHORT).show() }
+                    connectionWatchdog?.cancel()
+                    connectionWatchdog = null
 
-                    // 비정상/원치않은 끊김이면 자동 재연결
-                    val abnormal = (status != BluetoothGatt.GATT_SUCCESS) || !userInitiatedDisconnect
-                    if (abnormal) scheduleReconnect()
+                    // 🔁 프록시로 넘어갈 준비라면 세션키 보존, 아니면 삭제
+                    if (!keepKeysAcrossDisconnects) {
+                        deleteSharedKeyFor(keyOwnerId())
+                    } else {
+                        logCallback?.invoke("🔒 disconnect 시 shared_key 보존 (proxy 모드 재사용 목적)")
+                        keepKeysAcrossDisconnects = false // 1회성 사용 후 리셋
+                    }
+
+                    mainHandler.post {
+                        try { refreshDeviceCache(gatt) } catch (_: Exception) {}
+                        finalizeCloseAndClear()
+                        _connState.value = ConnState.Disconnected
+                        Toast.makeText(context, "BLE 연결 끊김", Toast.LENGTH_SHORT).show()
+
+                        val abnormal = (status != BluetoothGatt.GATT_SUCCESS) || !userInitiatedDisconnect
+                        if (abnormal) scheduleReconnect()
+                    }
                 }
-                else -> Log.d(TAG, "ℹ️ GATT 상태 변경: newState=$newState, status=$status")
+                else -> Unit
             }
         }
+
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -596,7 +766,18 @@ class BLEConnectionManager(
                 reconnectAttempt = 0
                 cancelReconnect()
 
-                enableNotification()
+                // 연결 워치독 해제
+                connectionWatchdog?.cancel()
+                connectionWatchdog = null
+
+                // MTU 확대 시도 → 콜백에서 CCCD 설정
+                try {
+                    gatt.requestMtu(517)
+                } catch (_: Exception) {
+                    Log.w(TAG, "requestMtu 실패 → 바로 Notify 설정 시도")
+                    enableNotification()
+                }
+
                 gatt.services.forEach { service ->
                     Log.d(TAG, "🔧 Service UUID: ${service.uuid}")
                     service.characteristics.forEach { characteristic ->
@@ -605,8 +786,17 @@ class BLEConnectionManager(
                 }
             } else {
                 Log.e(TAG, "서비스 검색 실패: status=$status")
-                // 서비스 검색 실패도 재연결 시도
                 scheduleReconnect()
+            }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            Log.d(TAG, "MTU changed: mtu=$mtu status=$status")
+            // MTU 확장 콜백 이후에 CCCD(Notify) 활성화
+            try {
+                enableNotification()
+            } catch (t: Throwable) {
+                Log.w(TAG, "enableNotification after MTU failed: ${t.message}")
             }
         }
 
@@ -649,7 +839,9 @@ class BLEConnectionManager(
             val packet = characteristic.value ?: run {
                 Log.e(TAG, "❌ characteristic.value == null"); return
             }
-            // 그대로 호출만
+
+
+            // 필요하면 raw chunk를 Proxy1에도 복사하고 싶을 때 true
             processIncomingPacket(
                 packet = packet,
                 direction = "rpi->app",
@@ -671,7 +863,7 @@ class BLEConnectionManager(
                     direction = direction,                 // "rpi->app" 등
                     mode = modeForType((packet[0].toInt() and 0xFF).toByte()),
                     payloadBytes = packet,                 // 헤더포함 “원 조각”
-                    sessionId = connectedDevice?.address,
+                    sessionId = keyOwnerId(),
                     seq = (packet[2].toInt() and 0xFF)     // index
                 )
             }
@@ -737,7 +929,7 @@ class BLEConnectionManager(
                     direction = direction,
                     mode = modeForType(type.toByte()),
                     payloadBytes = payload,            // 헤더 제거 + 조립 결과
-                    sessionId = connectedDevice?.address,
+                    sessionId = keyOwnerId(),
                     seq = msgId
                 )
             }
@@ -775,13 +967,14 @@ class BLEConnectionManager(
 
                     mainHandler.post {
                         try {
-                            connectedDevice?.address?.let { saveSharedKeyFor(it, sharedKey) }
+                            keyOwnerId()?.let { saveSharedKeyFor(it, sharedKey) }
                             sendLargeMessage(ciphertext, type = TYPE_KYBER_CIPHERTEXT, msgId = newMsgId())
                         } catch (e: Exception) {
                             Log.e(TAG, "❌ 키 저장/전송 처리 실패", e)
                             logCallback?.invoke("❌ 키 저장/전송 실패: ${e.message}")
                         }
                     }
+
                 } catch (t: Throwable) {
                     Log.e(TAG, "❌ Encapsulation 실패/크래시 감지", t)
                     logCallback?.invoke("❌ Encapsulation 실패: ${t.message}")
@@ -798,7 +991,7 @@ class BLEConnectionManager(
     }
 
     fun logSharedKey() {
-        val addr = connectedDevice?.address
+        val addr = keyOwnerId()
         if (addr == null) {
             Log.e(TAG, "❌ 디바이스 주소 없음")
             return
@@ -875,7 +1068,7 @@ class BLEConnectionManager(
     }
 
     fun sendEncryptedLedCommand(command: String) {
-        val key = loadSharedKeyFor(connectedDevice?.address)
+        val key = loadSharedKeyFor(keyOwnerId())
         if (key == null) {
             Log.e(TAG, "❌ 공유키 없음 - 암호화 중단")
             toastOnMain("❗ 먼저 공개키를 요청해 주세요.")
@@ -884,8 +1077,8 @@ class BLEConnectionManager(
         }
 
         val hexKey = key.joinToString(" ") { "%02X".format(it) }
-        Log.d(TAG, "🔐 [공유키 로그] ${connectedDevice?.address}: $hexKey")
-        logCallback?.invoke("🔐 공유키(hex@${connectedDevice?.address}): $hexKey")
+        Log.d(TAG, "🔐 [공유키 로그] ${keyOwnerId()}: $hexKey")
+        logCallback?.invoke("🔐 공유키(hex@${keyOwnerId()}): $hexKey")
 
         val encrypted = aesGcmEncrypt(command, key) ?: run {
             Log.e(TAG, "❌ 암호화 실패")
@@ -959,7 +1152,7 @@ class BLEConnectionManager(
             toastOnMain("❗ 텍스트가 비었습니다.")
             return
         }
-        val key = loadSharedKeyFor(connectedDevice?.address)
+        val key = loadSharedKeyFor(keyOwnerId())
         if (key == null) {
             logCallback?.invoke("❌ 공유키가 없습니다. 먼저 공개키를 요청(KYBER_REQ)하고 키 합의를 완료하세요.")
             toastOnMain("❗ 먼저 공개키를 요청해 키 합의를 완료하세요.")
@@ -1021,6 +1214,12 @@ class BLEConnectionManager(
 
     /** 🔐 공개키 요청을 패킷(헤더 포함)으로 전송 */
     fun sendKyberRequestPacketized() {
+        if (proxyMode) {
+            logCallback?.invoke("ℹ️ 프록시모드: 핸드셰이크 생략(기존 세션키 재사용)")
+            toastOnMain("프록시모드: 공개키 요청은 생략합니다.")
+            return
+        }
+
         val payload = "KYBER_REQ".toByteArray(Charsets.UTF_8)
         val msgId = newMsgId()
         logCallback?.invoke("📡 [REQ] KYBER_REQ packetized (len=${payload.size}, msgId=$msgId)")
@@ -1090,7 +1289,7 @@ class BLEConnectionManager(
 
     /** 0x03 타입(암호 패킷 경로)로 'TEST' 단일 패킷 보내기 */
     fun probePacket03Test() {
-        val key = loadSharedKeyFor(connectedDevice?.address)
+        val key = loadSharedKeyFor(keyOwnerId())
         if (key == null) {
             logCallback?.invoke("❌ (probe) 공유키 없음 → 0x03 테스트 차단")
             return
@@ -1151,6 +1350,10 @@ class BLEConnectionManager(
         TYPE_KYBER_REQ,
         TYPE_KYBER_CIPHERTEXT-> "secure-handshake"
         else                 -> "unknown"
+    }
+
+    fun setProxySessionId(id: String) {
+        proxySessionId = id.ifBlank { "proxy-session" }
     }
 
 }

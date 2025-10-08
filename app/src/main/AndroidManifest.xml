@@ -4,25 +4,40 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.obsqura">
 
-    <!-- BLE 하드웨어 선언 (중요) -->
+    <!-- BLE 하드웨어 사용 선언 -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <!-- (선택) 클래식 Bluetooth가 꼭 필요 없다면 false. 필요하면 지워도 무방 -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false"/>
 
-    <!-- Bluetooth 권한 -->
-    <uses-permission android:name="android.permission.BLUETOOTH"/>
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- ========= 권한 정리 =========
+         * Android 12(S, API31)+ : BLUETOOTH_SCAN/CONNECT 사용
+         * Android 11 이하       : FINE_LOCATION 으로 스캔 허용
+       ============================ -->
 
-    <!-- Android 12+ 전용 권한(단말이 28이면 자동 무시됨) -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" tools:targetApi="31"/>
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="31"/>
+    <!-- Android 12+ 전용 권한 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT"
+        tools:targetApi="31" />
 
-    <!-- 인터넷 권한 추가 -->
+    <!-- Android 11 이하용 위치 권한 (스캔용). 12+에서는 자동 무시되도록 maxSdkVersion=30 -->
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="30" />
+
+    <!-- 인터넷(WebSocket) -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- (선택) 아래 두 개는 Android 12+에서 의미 없음. 굳이 남기려면 maxSdkVersion으로 한정 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
 
     <application
         android:allowBackup="true"
@@ -33,8 +48,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.BLECommunicator"
-        tools:ignore="MissingApplicationIcon"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        tools:ignore="MissingApplicationIcon">
 
         <activity
             android:name=".SplashActivity"
@@ -48,7 +63,6 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
-        </activity>
+            android:exported="true" />
     </application>
 </manifest>

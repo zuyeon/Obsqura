@@ -62,11 +62,15 @@ class ProxyClient(private val url: String) : WebSocketListener() {
      * 20바이트 packet(헤더+payload)을 프록시에 그대로 릴레이.
      * typeHint는 디버깅/뷰어용 태그(선택).
      */
-    fun sendRelayPacket(packet20: ByteArray, typeHint: String? = null): Boolean {
+    fun sendRelayPacket(
+        packet20: ByteArray,
+        typeHint: String? = null,
+        direction: String = "app->rpi"   // ← 기본값
+    ): Boolean {
         val b64 = Base64.encodeToString(packet20, Base64.NO_WRAP)
         val obj = JSONObject().apply {
             put("kind", "relay")
-            put("direction", "app->rpi")
+            put("direction", direction)     // ← 추가
             put("payload_b64", b64)
             if (typeHint != null) put("type_hint", typeHint)
         }

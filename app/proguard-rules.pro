@@ -19,3 +19,10 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Kyber JNI (네이티브 연동 클래스 보존)
+-keep class com.example.obsqura.KyberJNI { *; }
+
+# OkHttp/Okio 경고 무시 (간헐적 경고 방지용 — 선택)
+-dontwarn okhttp3.**
+-dontwarn okio.**

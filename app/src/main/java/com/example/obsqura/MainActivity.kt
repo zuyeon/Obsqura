@@ -142,7 +142,6 @@ class MainActivity : ComponentActivity() {
         var recvProgressTotal by mutableStateOf(0)
         var showRecvProgress by mutableStateOf(false)
 
-        WsClient.start(ProxyConfig.PROXY_WS_URL)
 
         fun addLog(msg: String) {
             logMessages = (logMessages + msg).takeLast(100)
@@ -174,8 +173,6 @@ class MainActivity : ComponentActivity() {
             wsClient = WsClient
         )
 
-        // 2) 세션 키 일괄 삭제 (초기화 후)
-        bleConnectionManager.deleteSharedKeysOnLaunch()
 
         // 3) 권한/UI 설정은 onCreate 안에서 계속 진행
         requestPermissionsIfNeeded()
@@ -215,7 +212,26 @@ class MainActivity : ComponentActivity() {
                             recvProgressTotal = recvProgressTotal,
                             showRecvProgress = showRecvProgress,
                             onBack = { appMode = AppMode.NONE }
-                        )
+                        ).also {
+                            // (선택) TEST 들어올 땐 프록시모드 꺼두기
+                            bleConnectionManager.proxyMode = false
+                            bleConnectionManager.setProxyClient(null)
+                            bleConnectionManager.setAutoReconnectEnabled(true)
+                        }.let {
+                            LaunchedEffect(Unit) {
+                                val canScan = hasScanPermission() && isLocationEnabled() && bluetoothAdapter.isEnabled
+                                if (canScan) {
+                                    bleConnectionManager.connectByScanOnce(
+                                        targetName = "RPi-LED",
+                                        // targetServiceUuid = UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb"),
+                                        scanWindowMs = 8_000
+                                    )
+                                } else {
+                                    // 필요한 경우 사용자 안내 로그
+                                    Log.d("AUTO_CONNECT", "Skip auto-scan: permission/location/bt not ready")
+                                }
+                            }
+                        }
 
                         AppMode.SCENARIO -> ScenarioModeScreen(
                             ble = bleConnectionManager,
@@ -223,18 +239,39 @@ class MainActivity : ComponentActivity() {
                         )
 
                         AppMode.PROXY -> {
-                            // 프록시 모드 진입 시 프록시 클라이언트 시작 (한 번만)
                             LaunchedEffect(Unit) {
                                 if (proxyClient == null) {
-                                    proxyClient = ProxyClient("ws://100.76.136.25:8080/ws") // 프록시2 URL이면 여기 교체
+                                    proxyClient = ProxyClient("ws://100.76.136.25:8080/ws")
                                     proxyClient?.start()
                                 }
+
+                                // 🔹 1) 현재 연결 주소 확보 (끊기기 전에)
+                                val srcAddr = bleConnectionManager.getConnectedDevice()?.address
+
+                                // 🔹 2) 다음 disconnect에서 키 삭제하지 않도록 1회 보존
+                                bleConnectionManager.setKeepSharedKeyOnNextDisconnect(true)
+
+                                // 🔹 3) BLE 자동재연결 OFF + 연결 끊기
+                                bleConnectionManager.setAutoReconnectEnabled(false)
+                                bleConnectionManager.disconnect()
+
+                                // 🔹 4) 프록시 세션ID 지정(임의로 고정하거나 필요 시 동적으로)
+                                bleConnectionManager.setProxySessionId("proxy-session")
+
+                                // 🔹 5) 기존(shared_key_<addr>.bin) → shared_key_proxy-session.bin 복사
+                                srcAddr?.let { bleConnectionManager.copySharedKeyFromAddressToProxySession(it) }
+
+                                // 🔹 6) 프록시 클라이언트 주입 + 프록시 모드 ON
+                                bleConnectionManager.setProxyClient(proxyClient)
+                                bleConnectionManager.proxyMode = true
                             }
 
-                            // ✅ 인자에서 proxyClient 빼세요
                             ProxyModeScreen(
-                                proxyClient = proxyClient,
+                                ble = bleConnectionManager,
                                 onBack = {
+                                    bleConnectionManager.proxyMode = false
+                                    bleConnectionManager.setProxyClient(null)
+                                    bleConnectionManager.setAutoReconnectEnabled(true)
                                     proxyClient?.stop()
                                     proxyClient = null
                                     appMode = AppMode.NONE
@@ -382,7 +419,17 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         WsClient.stop()
+        bleConnectionManager.proxyMode = false
+        bleConnectionManager.setProxyClient(null)
         proxyClient?.stop()
+        bleConnectionManager.disconnect()   // ← 추가: BLE도 정리
     }
+
+    override fun onStop() {
+        super.onStop()
+        // 화면 떠날 때 스캔 중이면 안전 종료
+        runCatching { stopBleScan() }
+    }
+
 }
 data class CustomBluetoothDevice(val device: BluetoothDevice, val displayName: String)

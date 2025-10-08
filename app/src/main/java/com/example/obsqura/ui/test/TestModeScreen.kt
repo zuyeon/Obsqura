@@ -48,15 +48,12 @@ fun TestModeScreen(
 ) {
     val context = LocalContext.current
 
-    // 🔄 BLE 연결 상태/자동재연결 토글 (Test 모드에만 노출)
+    // ✅ 연결 상태만 표시 (Auto Reconnect 토글 제거)
     val connState by ble.connState.collectAsState()
-    var autoReconn by rememberSaveable { mutableStateOf(true) }
-    LaunchedEffect(autoReconn) { ble.setAutoReconnectEnabled(autoReconn) }
 
     var scannedDevices by remember { mutableStateOf<List<CustomBluetoothDevice>>(emptyList()) }
     var connectedDevice by remember { mutableStateOf<android.bluetooth.BluetoothDevice?>(null) }
     var connectedTime by remember { mutableStateOf<String?>(null) }
-    var ledOn by remember { mutableStateOf(false) }
     var messageText by remember { mutableStateOf("") }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -101,7 +98,7 @@ fun TestModeScreen(
                     )
                 }
 
-                // ✅ 자동 재연결 토글 + 상태 표시 (여기 추가)
+                // ✅ 상태바(연결 상태만 표시 / 토글 제거)
                 Spacer(Modifier.height(12.dp))
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
@@ -113,10 +110,8 @@ fun TestModeScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // 상태 텍스트
                         val stateText = when (val s = connState) {
                             BLEConnectionManager.ConnState.Disconnected -> "🔌 Disconnected"
                             BLEConnectionManager.ConnState.Connecting -> "⏳ Connecting…"
@@ -128,12 +123,6 @@ fun TestModeScreen(
                             is BLEConnectionManager.ConnState.Failed -> "❌ Failed"
                         }
                         Text(stateText, style = MaterialTheme.typography.bodyMedium)
-
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Auto Reconnect", style = MaterialTheme.typography.bodySmall)
-                            Spacer(Modifier.width(8.dp))
-                            Switch(checked = autoReconn, onCheckedChange = { autoReconn = it })
-                        }
                     }
                 }
 
@@ -269,21 +258,7 @@ fun TestModeScreen(
                                         modifier = Modifier.fillMaxWidth()
                                     ) { Text("🔐 공개키 요청") }
 
-                                    Spacer(modifier = Modifier.height(10.dp))
-
-                                    Button(
-                                        onClick = {
-                                            val serviceUUID = java.util.UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb")
-                                            val charUUID = java.util.UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb")
-                                            ble.sendData(serviceUUID, charUUID, byteArrayOf(0x04, 0x00, 0x00, 0x01))
-                                        },
-                                        shape = MaterialTheme.shapes.large,
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = MaterialTheme.colorScheme.tertiary,
-                                            contentColor = MaterialTheme.colorScheme.onTertiary
-                                        ),
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) { Text("📶 Ping 테스트") }
+                                    // ⛔️ 여기 있던 "📶 Ping 테스트" 버튼은 제거했습니다.
 
                                     Spacer(modifier = Modifier.height(16.dp))
                                     Text("✉️ 텍스트 전송", color = MaterialTheme.colorScheme.onSurface)
@@ -367,9 +342,11 @@ fun TestModeScreen(
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
-                                    LazyColumn(modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(120.dp)) {
+                                    LazyColumn(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(120.dp)
+                                    ) {
                                         items(logMessages) { log ->
                                             Text(
                                                 log,
