@@ -247,12 +247,21 @@ class BLEConnectionManager(
                 proxyConnected = false
                 logCallback?.invoke("🌐 Proxy2 오류: $err")
             }
+
             override fun onRawText(msg: String) {
-                // 프록시가 올린 relay 메시지를 기존 처리기로 넘김
-                proxyListener.onRawText(msg)
+                runCatching {
+                    val j = org.json.JSONObject(msg)
+                    if (j.optString("kind") == "relay" && j.has("payload_b64")) {
+                        val b64 = j.getString("payload_b64")
+                        val bytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+                        val dir = j.optString("direction", "proxy->app")
+                        processIncomingPacket(bytes, dir, sendCopyRawChunk = true) // ★
+                    }
+                }
             }
+
             override fun onRawBinary(bytes: ByteArray) {
-                proxyListener.onRawBinary(bytes)
+                processIncomingPacket(bytes, "proxy->app", sendCopyRawChunk = true) // ★
             }
         }
 
@@ -700,15 +709,10 @@ class BLEConnectionManager(
             runCatching {
                 wsClient?.sendCopy(
                     direction = "app->proxy",
-                    mode = when (sendingType) {
-                        TYPE_TEXT_PLAIN -> "legacy"
-                        TYPE_AES_MESSAGE -> "secure"
-                        TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
-                        else -> "unknown"
-                    },
-                    payloadBytes = packet,
+                    mode = modeForType(sendingType),
+                    payloadBytes = packet,          // 20B 헤더 포함 조각 자체
                     sessionId = keyOwnerId(),
-                    seq = (sendingMsgId.toInt() and 0xFF),
+                    seq = index,                    // ★ 조각 번호로!
                     mitm = mitmEnabled
                 )
             }
@@ -746,6 +750,17 @@ class BLEConnectionManager(
         }
 
         // (BLE 경로)
+        runCatching {
+            wsClient?.sendCopy(
+                direction = "app->rpi",              // ★ BLE 직결 라벨
+                mode = modeForType(sendingType),
+                payloadBytes = packet,               // 20B 헤더 포함 조각
+                sessionId = keyOwnerId(),
+                seq = index,                         // ★ 조각 번호
+                mitm = mitmEnabled
+            )
+        }
+
         if (retryCount >= 3) {
             Log.e(TAG, "❌ 패킷 $index 전송 3회 실패 - 전송 중단")
             logCallback?.invoke("❌ 패킷 $index 전송 3회 실패 - 전송 중단")
@@ -944,7 +959,7 @@ class BLEConnectionManager(
             processIncomingPacket(
                 packet = packet,
                 direction = "rpi->app",
-                sendCopyRawChunk = false
+                sendCopyRawChunk = true   // ★ 조각 복사 ON
             )
         }
     }

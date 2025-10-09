@@ -55,19 +55,27 @@ object WsClient : WebSocketListener() {
         sessionId: String? = null,
         seq: Int? = null,
         mitm: Boolean? = null,
-        event: String? = null
+        event: String? = null,
+        part: String? = null            // ★ 추가: "chunk" | "assembled"
     ): Boolean {
         val b64 = payloadBytes?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
+        val safeSession = sessionId ?: "unknown"   // ★ null-safe
         val jsonSb = StringBuilder()
         jsonSb.append('{')
+
+        // (선택) 관찰용 이벤트임을 식별하고 싶으면 다음 한 줄 추가해도 됨
+        // jsonSb.append("\"kind\":\"copy\",")
+
         jsonSb.append("\"timestamp\":").append("\"").append(System.currentTimeMillis()).append("\",")
         jsonSb.append("\"direction\":").append("\"").append(direction).append("\",")
         jsonSb.append("\"mode\":").append("\"").append(mode).append("\"")
-        if (sessionId != null) jsonSb.append(",\"session_id\":\"").append(sessionId).append("\"")
-        if (seq != null) jsonSb.append(",\"seq\":").append(seq)
-        if (mitm != null) jsonSb.append(",\"mitm\":").append(mitm)
+        jsonSb.append(",\"session_id\":\"").append(safeSession).append("\"") // ★ 항상 출력
+
+        if (seq != null)   jsonSb.append(",\"seq\":").append(seq)
+        if (mitm != null)  jsonSb.append(",\"mitm\":").append(mitm)
         if (event != null) jsonSb.append(",\"event\":\"").append(event).append("\"")
-        if (b64 != null) jsonSb.append(",\"payload_b64\":\"").append(b64).append("\"")
+        if (part != null)  jsonSb.append(",\"part\":\"").append(part).append("\"") // ★ 추가
+        if (b64 != null)   jsonSb.append(",\"payload_b64\":\"").append(b64).append("\"")
         jsonSb.append('}')
         return (ws?.send(jsonSb.toString()) == true)
     }
