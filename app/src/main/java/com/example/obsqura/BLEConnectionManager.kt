@@ -60,6 +60,11 @@ class BLEConnectionManager(
     private var proxyClient: ProxyClient? = null
     @Volatile var proxyMode: Boolean = false   // true면 프록시2 경유
     private var proxySessionId: String = "proxy-session" // 프록시 경유 시 키 파일 ownerId
+    @Volatile private var proxyConnected: Boolean = false
+    private var proxyClientBridgeListener: ProxyClient.Listener? = null
+    @Volatile private var txGeneration: Int = 0
+    @Volatile private var activeSendGen: Int = 0
+
 
     // ...아래에 헬퍼 추가
     private fun keyOwnerId(): String? =
@@ -122,6 +127,40 @@ class BLEConnectionManager(
         private const val SC_EMOJI = "🧪"
     }
 
+    /** 모드 전환·화면 이동 시, 모든 지연 콜백/전송 루프를 끊는 스위치 */
+    fun abortAllSendsAndTimers() {
+        txGeneration++
+        writeInProgress = false
+        packetList = emptyList()
+        packetRetryMap.clear()
+        currentSendingIndex = 0
+
+        // ⬇ 수신 상태도 초기화
+        packetBuffer.clear()
+        receivedIndices.clear()
+        currentMsgId = null
+        currentTotalPackets = -1
+
+        progressCallback?.invoke(0, 0)
+        receiveProgressCallback?.invoke(0, 0)
+    }
+
+    // 하드 리셋(콜드 부트용)
+    fun coldBootReset() {
+        try { abortAllSendsAndTimers() } catch (_: Exception) {}
+        try { setAutoReconnectEnabled(false) } catch (_: Exception) {}
+        try { safeDisconnectAndClose("cold-boot") } catch (_: Exception) {}
+        try { finalizeCloseAndClear() } catch (_: Exception) {}
+
+        // 프록시/MITM/키 등 모든 상태 원복
+        proxyMode = false
+        setProxyClient(null)
+        mitmEnabled = false
+
+        // 내부에 남은 shared_key_* 파일 싹 제거
+        deleteSharedKeysOnLaunch()
+    }
+
     // ---- 시나리오 로그 헬퍼 (BLE_COMM 한 태그만 사용) ----
     private fun scLog(msg: String) {
         val line = "🧪 $msg"
@@ -181,10 +220,47 @@ class BLEConnectionManager(
     }
 
     fun setProxyClient(pc: ProxyClient?) {
-        proxyClient?.removeListener(proxyListener)
+        // 1) 이전 ProxyClient에서 우리가 등록했던 브릿지 리스너를 제거
+        proxyClientBridgeListener?.let { old ->
+            proxyClient?.removeListener(old)
+        }
+
+        // 2) 교체
         proxyClient = pc
-        pc?.addListener(proxyListener)
+        proxyConnected = false
+        proxyClientBridgeListener = null
+
+        // 3) null 이면 끝
+        if (pc == null) return
+
+        // 4) 새 브릿지 리스너 생성 (상태 갱신 + 수신은 기존 proxyListener로 위임)
+        val bridge = object : ProxyClient.Listener {
+            override fun onOpen() {
+                proxyConnected = true
+                logCallback?.invoke("🌐 Proxy2 연결됨")
+            }
+            override fun onClose(code: Int, reason: String) {
+                proxyConnected = false
+                logCallback?.invoke("🌐 Proxy2 종료: $code/$reason")
+            }
+            override fun onError(err: String) {
+                proxyConnected = false
+                logCallback?.invoke("🌐 Proxy2 오류: $err")
+            }
+            override fun onRawText(msg: String) {
+                // 프록시가 올린 relay 메시지를 기존 처리기로 넘김
+                proxyListener.onRawText(msg)
+            }
+            override fun onRawBinary(bytes: ByteArray) {
+                proxyListener.onRawBinary(bytes)
+            }
+        }
+
+        // 5) 등록해두고, 다음 교체 때 정확히 제거할 수 있도록 필드에 보관
+        proxyClientBridgeListener = bridge
+        pc.addListener(bridge)
     }
+
 
     fun enableNotifications(
         context: Context,   // 👈 context를 하나 받도록 수정
@@ -515,12 +591,15 @@ class BLEConnectionManager(
     private var writeInProgress = false
 
     @SuppressLint("MissingPermission")
-    private fun sendDataWithRetry(data: ByteArray) {
+    private fun sendDataWithRetry(data: ByteArray, gen: Int) {
         // 항상 메인 스레드에서 writeCharacteristic 수행
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post { sendDataWithRetry(data) }
+            mainHandler.post { sendDataWithRetry(data, gen) }
             return
         }
+
+        // 이미 중단된 전송이면 리턴
+        if (gen != txGeneration) return
 
         if (!hasPermission()) return
         val gatt = bluetoothGatt ?: return
@@ -529,7 +608,7 @@ class BLEConnectionManager(
 
         if (writeInProgress) {
             Log.w(TAG, "✋ 이전 write 작업 대기 중 - writeCharacteristic() 생략")
-            mainHandler.postDelayed({ sendDataWithRetry(data) }, 50)
+            mainHandler.postDelayed({ sendDataWithRetry(data, gen) }, 50)
             return
         }
 
@@ -541,10 +620,11 @@ class BLEConnectionManager(
         if (!success) {
             Log.e(TAG, "❌ writeCharacteristic() 실패 - index=$currentSendingIndex")
             writeInProgress = false
-            mainHandler.postDelayed({ sendPacketAt(currentSendingIndex) }, 100)
+            mainHandler.postDelayed({ sendPacketAt(currentSendingIndex, gen) }, 100)
             return
         }
     }
+
 
     fun sendLargeMessage(rawData: ByteArray, type: Byte, msgId: Byte) {
         // 0x03인 경우 키가 있는지 강제 검증
@@ -557,12 +637,12 @@ class BLEConnectionManager(
             }
         }
 
-
         // 항상 메인 스레드 보장
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post { sendLargeMessage(rawData, type, msgId) }
             return
         }
+
 
 
         val payloadSize = 16
@@ -589,20 +669,37 @@ class BLEConnectionManager(
         // ✅ 진행률 0% 알림
         progressCallback?.let { it(0, packetList.size) }
 
-        sendPacketAt(currentSendingIndex)
+        // 전송 시작 시 '이번 전송의 세대'를 고정
+        activeSendGen = txGeneration
+        val gen = activeSendGen
+
+        sendPacketAt(currentSendingIndex, gen)
     }
 
-    private fun sendPacketAt(index: Int) {
+    private fun sendPacketAt(index: Int, gen: Int = activeSendGen) {
+        // 세대 불일치면 즉시 중단 (모드 전환 등으로 중단된 작업)
+        if (gen != txGeneration) {
+            logCallback?.invoke("⛔ 중단된 전송 세대 감지(gen mismatch). drop idx=$index")
+            return
+        }
+
         if (index >= packetList.size) return
         val packet = packetList[index]
         val retryCount = packetRetryMap.getOrDefault(index, 0)
 
-        // ✅ Proxy2 경유 모드
         if (proxyMode) {
-            // (1) 프록시1(뷰어)에도 계속 복사본 보내기
+            if (!proxyConnected || proxyClient == null) {
+                logCallback?.invoke(
+                    "⏳ Proxy2 미연결: idx=$index (100ms 재시도) " +
+                            "[connected=$proxyConnected, hasClient=${proxyClient != null}]"
+                )
+                mainHandler.postDelayed({ sendPacketAt(index, gen) }, 100)
+                return
+            }
+
             runCatching {
                 wsClient?.sendCopy(
-                    direction = "app->proxy", // 라벨만 바꿔서 구분
+                    direction = "app->proxy",
                     mode = when (sendingType) {
                         TYPE_TEXT_PLAIN -> "legacy"
                         TYPE_AES_MESSAGE -> "secure"
@@ -610,46 +707,45 @@ class BLEConnectionManager(
                         else -> "unknown"
                     },
                     payloadBytes = packet,
-                    sessionId = keyOwnerId(), // 연결주소 대신 세션ID
+                    sessionId = keyOwnerId(),
                     seq = (sendingMsgId.toInt() and 0xFF),
                     mitm = mitmEnabled
                 )
             }
 
-            // (2) 실제 중계는 Proxy2로
-            val ok = proxyClient?.sendRelayPacket(
+            val ok = proxyClient!!.sendRelayPacket(
                 packet20 = packet,
                 typeHint = when (sendingType) {
                     TYPE_TEXT_PLAIN -> "legacy"
                     TYPE_AES_MESSAGE -> "secure"
                     TYPE_KYBER_REQ, TYPE_KYBER_CIPHERTEXT -> "secure-handshake"
                     else -> "unknown"
-                }
-            ) == true
+                },
+                direction = "app->rpi"
+            )
 
             if (!ok) {
-                logCallback?.invoke("⚠️ Proxy2 릴레이 실패(idx=$index) - 재시도 예정")
-                mainHandler.postDelayed({ sendPacketAt(index) }, 200)
+                logCallback?.invoke("⚠️ Proxy2 전송 실패(idx=$index) → 재시도")
+                mainHandler.postDelayed({ sendPacketAt(index, gen) }, 200)
                 return
             }
 
-            // (3) BLE write 콜백이 없으므로 진행률/다음 패킷을 직접 갱신
             logCallback?.invoke("🌐 Proxy2로 패킷 전송 성공 idx=$index/${packetList.size}")
             progressCallback?.let { it(index + 1, packetList.size) }
             currentSendingIndex = index + 1
             if (currentSendingIndex < packetList.size) {
-                mainHandler.postDelayed({ sendPacketAt(currentSendingIndex) }, 60)
+                mainHandler.postDelayed({ sendPacketAt(currentSendingIndex, gen) }, 60)
             } else {
                 logCallback?.invoke("✅ 전체 패킷 전송 완료 (msgId=$sendingMsgId, via Proxy2)")
                 val failed = packetRetryMap.count { it.value >= 2 }
                 val retried = packetRetryMap.count { it.value > 1 }
                 val total = packetList.size
-                logCallback?.invoke("📊 전송률 통계: 전체 $total 개 중 ${total - failed} 개 성공 / $failed 개 실패 / $retried 개 재시도 이상")
+                logCallback?.invoke("📊 전송률 통계: 전체 $total 중 ${total - failed} 성공 / $failed 실패 / $retried 재시도 이상")
             }
             return
         }
 
-        // ➌ 아래는 기존 BLE write 로직 그대로
+        // (BLE 경로)
         if (retryCount >= 3) {
             Log.e(TAG, "❌ 패킷 $index 전송 3회 실패 - 전송 중단")
             logCallback?.invoke("❌ 패킷 $index 전송 3회 실패 - 전송 중단")
@@ -662,7 +758,7 @@ class BLEConnectionManager(
 
         packetRetryMap[index] = retryCount + 1
         logCallback?.invoke("📤 전송중: idx=$index (재시도 ${retryCount + 1}/3)")
-        sendDataWithRetry(packet) // ← BLE write
+        sendDataWithRetry(packet, gen)
     }
 
     fun enableNotification(serviceUUID: UUID = SERVICE_UUID, charUUID: UUID = CHARACTERISTIC_UUID) {
@@ -805,6 +901,9 @@ class BLEConnectionManager(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            val gen = activeSendGen
+            if (gen != txGeneration) return
+
             writeInProgress = false //  다음 write 허용
 
             if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -815,7 +914,7 @@ class BLEConnectionManager(
 
                 currentSendingIndex++
                 if (currentSendingIndex < packetList.size) {
-                    mainHandler.postDelayed({ sendPacketAt(currentSendingIndex) }, 60)
+                    mainHandler.postDelayed({ sendPacketAt(currentSendingIndex, gen) }, 60)
                 } else {
                     logCallback?.invoke("✅ 전체 패킷 전송 완료 (msgId=$sendingMsgId)")
                     if (sendingType == 0x03.toByte()) {
@@ -828,7 +927,7 @@ class BLEConnectionManager(
                 }
             } else {
                 logCallback?.invoke("⚠️ 패킷 $currentSendingIndex 전송 실패 - 재시도 예정")
-                mainHandler.postDelayed({ sendPacketAt(currentSendingIndex) }, 200)
+                mainHandler.postDelayed({ sendPacketAt(currentSendingIndex, gen) }, 200)
             }
         }
 
@@ -1355,5 +1454,12 @@ class BLEConnectionManager(
     fun setProxySessionId(id: String) {
         proxySessionId = id.ifBlank { "proxy-session" }
     }
+
+    fun hasSharedKeyFor(id: String?): Boolean {
+        if (id.isNullOrBlank()) return false
+        val f = File(context.filesDir, "shared_key_${id}.bin")
+        return f.exists() && f.length() >= 32
+    }
+    fun hasSharedKeyForProxy(): Boolean = hasSharedKeyFor(proxySessionId)
 
 }
