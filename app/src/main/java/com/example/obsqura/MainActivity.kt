@@ -274,16 +274,15 @@ class MainActivity : ComponentActivity() {
                                 val srcAddr = bleConnectionManager.getConnectedDevice()?.address
                                 val hasAddrKey = bleConnectionManager.hasSharedKeyFor(srcAddr)
 
-                                // 2) 주소키도 없고 proxy-session 키도 없으면 프록시 진입 차단
+                                // 2) 주소키도 없고 proxy-session 키도 없으면 → 진입은 허용(암호 전송만 불가)
                                 if (!hasAddrKey && !bleConnectionManager.hasSharedKeyForProxy()) {
-                                    Log.w("PROXY_MODE", "세션키 없음 → Proxy 진입 차단, TEST로 전환")
+                                    Log.w("PROXY_MODE", "세션키 없음 → 프록시 진입은 허용(암호 전송 불가)")
                                     Toast.makeText(
                                         this@MainActivity,
-                                        "프록시용 공유키가 없습니다. 먼저 TEST/SCENARIO에서 공개키 요청으로 키 합의를 완료하세요.",
+                                        "공유키가 없어 암호 전송은 불가합니다(평문/관찰만 가능).",
                                         Toast.LENGTH_SHORT
                                     ).show()
-                                    appMode = AppMode.TEST
-                                    return@LaunchedEffect
+                                    // 여기서 return 하지 말고 계속 진행
                                 }
 
                                 // 3) proxy 세션 ID 고정

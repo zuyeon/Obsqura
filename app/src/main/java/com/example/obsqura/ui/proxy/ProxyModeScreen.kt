@@ -19,6 +19,9 @@ fun ProxyModeScreen(
     var text by remember { mutableStateOf("") }
     val canSend = text.isNotBlank()
 
+    // 🔑 현재 프록시 세션(혹은 BLE 주소) 기준으로 암호 가능 여부
+    val canEncrypt = ble.canEncryptNow()
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -35,9 +38,12 @@ fun ProxyModeScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.Start
         ) {
-            // 상태 표시만 간단히
+            // 상태 표시
             Text(
-                text = if (ble.proxyMode) "프록시 경유 모드 " else "프록시 모드 꺼짐",
+                text = buildString {
+                    append(if (ble.proxyMode) "프록시 경유 모드" else "프록시 모드 꺼짐")
+                    append(" • 키: "); append(if (canEncrypt) "존재" else "없음")
+                },
                 style = MaterialTheme.typography.bodyMedium
             )
 
@@ -62,12 +68,20 @@ fun ProxyModeScreen(
 
                 Button(
                     onClick = { ble.sendEncryptedTextMessage(text) },
-                    enabled = canSend, // 키 없으면 BLEConnectionManager가 토스트로 안내함
+                    // ⬇️ 키 없으면 버튼 자체 비활성화
+                    enabled = canSend && canEncrypt,
                     modifier = Modifier.weight(1f)
                 ) { Text("🔒 암호 전송") }
             }
 
-
+            // (선택) 안내 문구
+            if (!canEncrypt) {
+                Text(
+                    "암호 전송은 공유키 합의 후 가능해요. (테스트/시나리오 모드에서 공개키 요청 실행 → 프록시로 전환)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 }

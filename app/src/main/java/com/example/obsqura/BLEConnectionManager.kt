@@ -1477,4 +1477,6 @@ class BLEConnectionManager(
     }
     fun hasSharedKeyForProxy(): Boolean = hasSharedKeyFor(proxySessionId)
 
+    fun canEncryptNow(): Boolean = hasSharedKeyFor(keyOwnerId())
+
 }
